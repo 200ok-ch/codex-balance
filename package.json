@@ -2,6 +2,7 @@
   "name": "codex-balance",
   "version": "0.1.0",
   "description": "Print remaining Codex usage limits for status bars and scripts.",
+  "license": "MIT",
   "type": "commonjs",
   "bin": {
     "codex-balance": "./codex-balance.js"
