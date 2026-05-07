@@ -1,0 +1,57 @@
+#+TITLE: codex-balance
+
+Print the remaining Codex 5-hour and weekly usage limits for status bars, shell scripts, and small desktop widgets.
+
+This is for people who want their current Codex balance visible at a glance instead of manually refreshing the Codex analytics page throughout the day.
+
+#+begin_src text
+5h: 94% | week: 95%
+#+end_src
+
+* Requirements
+
+- Node.js 20 or newer
+- Firefox with an active ChatGPT login
+- =sqlite3=, used to read Firefox's cookie database
+- Playwright Firefox browser binaries
+
+Install the JavaScript dependency and browser binary:
+
+#+begin_src sh
+npm install
+npx playwright install firefox
+#+end_src
+
+* Usage
+
+#+begin_src sh
+./codex-balance.js
+#+end_src
+
+Each invocation performs a live headless Firefox refresh. Poll every 10 minutes from your status bar or scheduler to keep runtime and network usage low.
+
+* Polybar Example
+
+#+begin_src conf
+[module/codex-balance]
+type = custom/script
+exec = /path/to/codex-balance/codex-balance.js
+interval = 600
+#+end_src
+
+Then add =codex-balance= to your Polybar module list.
+
+* Configuration
+
+Useful environment variables:
+
+#+begin_src sh
+FIREFOX_PROFILE_DIR=/path/to/profile ./codex-balance.js
+FIREFOX_PROFILES_INI=/path/to/profiles.ini ./codex-balance.js
+FIREFOX_EXECUTABLE=/path/to/playwright/firefox ./codex-balance.js
+CODEX_BALANCE_TIMEOUT_MS=8000 ./codex-balance.js
+#+end_src
+
+* Security Notes
+
+This script reads ChatGPT/OpenAI cookies from your Firefox profile and injects them into a fresh headless Playwright Firefox context. It does not open or lock your live Firefox profile.
