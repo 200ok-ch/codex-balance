@@ -7,8 +7,14 @@ const { execFileSync } = require('child_process');
 
 const CODEX_URL = 'https://chatgpt.com/codex/cloud/settings/analytics';
 const TIMEOUT_MS = Number(process.env.CODEX_BALANCE_TIMEOUT_MS || 6000);
-const PROFILE_INI = process.env.FIREFOX_PROFILES_INI || path.join(os.homedir(), '.mozilla', 'firefox', 'profiles.ini');
+const DEFAULT_PROFILE_INIS = [
+  path.join(os.homedir(), '.mozilla', 'firefox', 'profiles.ini'),
+  path.join(os.homedir(), 'snap', 'firefox', 'common', '.mozilla', 'firefox', 'profiles.ini'),
+];
+const PROFILE_INI = process.env.FIREFOX_PROFILES_INI || DEFAULT_PROFILE_INIS.find((candidate) => fs.existsSync(candidate)) || DEFAULT_PROFILE_INIS[0];
 const FIREFOX_EXECUTABLE = process.env.FIREFOX_EXECUTABLE;
+
+const PROFILE_HELP = 'Set FIREFOX_PROFILE_DIR to a Firefox profile that is signed in to ChatGPT.';
 
 function loadPlaywright() {
   const candidates = [
@@ -68,21 +74,100 @@ function parseIni(contents) {
   return sections;
 }
 
-function firefoxBaseDir() {
-  return path.dirname(PROFILE_INI);
+function firefoxBaseDir(profileIni = PROFILE_INI) {
+  return path.dirname(profileIni);
 }
 
-function resolveProfilePath(profile) {
+function resolveProfilePath(profile, profileIni = PROFILE_INI) {
   const profilePath = profile.values.Path;
   if (!profilePath) return null;
-  return profile.values.IsRelative === '1' ? path.join(firefoxBaseDir(), profilePath) : profilePath;
+  return profile.values.IsRelative === '1' ? path.join(firefoxBaseDir(profileIni), profilePath) : profilePath;
+}
+
+function profileIniCandidates() {
+  if (process.env.FIREFOX_PROFILES_INI) return [PROFILE_INI];
+  return DEFAULT_PROFILE_INIS.filter((profileIni) => fs.existsSync(profileIni));
+}
+
+function firefoxProfiles(profileIni = PROFILE_INI) {
+  if (!fs.existsSync(profileIni)) {
+    throw new Error(`Firefox profiles.ini was not found at ${profileIni}. ${PROFILE_HELP}`);
+  }
+
+  const sections = parseIni(fs.readFileSync(profileIni, 'utf8'));
+  const installDefaultPath = sections.find((section) => section.name.startsWith('Install'))?.values.Default;
+
+  return sections
+    .filter((section) => section.name.startsWith('Profile'))
+    .map((section) => {
+      const profileDir = resolveProfilePath(section, profileIni);
+      return {
+        name: section.values.Name || section.name,
+        path: profileDir,
+        profilesIni: profileIni,
+        exists: Boolean(profileDir && fs.existsSync(profileDir)),
+        default: section.values.Default === '1' || section.values.Path === installDefaultPath,
+      };
+    });
+}
+
+function chatgptCookieHosts(profileDir) {
+  const source = path.join(profileDir, 'cookies.sqlite');
+  if (!fs.existsSync(source)) return [];
+
+  const copied = copyCookieDatabase(profileDir);
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const output = execFileSync('sqlite3', [
+      '-json',
+      copied.database,
+      `select distinct host
+       from moz_cookies
+       where (host like '%chatgpt.com' or host like '%openai.com')
+         and (expiry = 0 or expiry > ${now})
+       order by host`,
+    ], { encoding: 'utf8', maxBuffer: 1024 * 1024 });
+
+    return (output.trim() ? JSON.parse(output) : []).map((row) => row.host);
+  } finally {
+    fs.rmSync(copied.tmpRoot, { recursive: true, force: true });
+  }
+}
+
+function listProfiles() {
+  const profiles = profileIniCandidates().flatMap((profileIni) => firefoxProfiles(profileIni));
+  if (profiles.length === 0) throw new Error(`No Firefox profiles found in ${PROFILE_INI}.`);
+
+  let previousProfileIni = null;
+
+  for (const profile of profiles) {
+    if (profile.profilesIni !== previousProfileIni) {
+      if (previousProfileIni) console.log('');
+      console.log(`profiles.ini: ${profile.profilesIni}`);
+      previousProfileIni = profile.profilesIni;
+    }
+
+    const labels = [];
+    if (profile.default) labels.push('default');
+    if (!profile.exists) labels.push('missing');
+
+    let cookieInfo = 'ChatGPT cookies: not checked';
+    if (profile.exists) {
+      const hosts = chatgptCookieHosts(profile.path);
+      cookieInfo = hosts.length > 0 ? `ChatGPT cookies: yes (${hosts.join(', ')})` : 'ChatGPT cookies: no';
+    }
+
+    console.log(`  ${profile.name}${labels.length ? ` [${labels.join(', ')}]` : ''}`);
+    console.log(`    path: ${profile.path || '(none)'}`);
+    console.log(`    ${cookieInfo}`);
+  }
 }
 
 function defaultFirefoxProfileDir() {
   if (process.env.FIREFOX_PROFILE_DIR) return path.resolve(process.env.FIREFOX_PROFILE_DIR);
 
   if (!fs.existsSync(PROFILE_INI)) {
-    throw new Error('Firefox profiles.ini was not found. Set FIREFOX_PROFILE_DIR to your logged-in Firefox profile.');
+    throw new Error(`Firefox profiles.ini was not found. ${PROFILE_HELP}`);
   }
 
   const sections = parseIni(fs.readFileSync(PROFILE_INI, 'utf8'));
@@ -97,7 +182,7 @@ function defaultFirefoxProfileDir() {
 
   const profileDir = profile && resolveProfilePath(profile);
   if (!profileDir || !fs.existsSync(profileDir)) {
-    throw new Error('Unable to find a Firefox profile. Set FIREFOX_PROFILE_DIR to your logged-in Firefox profile.');
+    throw new Error(`Unable to find a Firefox profile. ${PROFILE_HELP}`);
   }
 
   return profileDir;
@@ -139,7 +224,7 @@ function firefoxCookies(profileDir) {
       throw new Error('Unable to read Firefox cookies with sqlite3.');
     }
 
-    const rows = JSON.parse(output);
+    const rows = output.trim() ? JSON.parse(output) : [];
 
     const cookies = rows.map((row) => {
       const expiry = Number(row.expiry);
@@ -155,7 +240,7 @@ function firefoxCookies(profileDir) {
     });
 
     if (!cookies.some((cookie) => cookie.domain.includes('chatgpt.com'))) {
-      throw new Error('No chatgpt.com cookies found in the selected Firefox profile. Sign in to ChatGPT in Firefox first.');
+      throw new Error(`No chatgpt.com cookies found in the selected Firefox profile. Sign in to ChatGPT in Firefox first, or set FIREFOX_PROFILE_DIR to a Firefox profile that is signed in to ChatGPT.`);
     }
 
     return cookies;
@@ -258,6 +343,11 @@ async function extractBalances(page) {
 }
 
 async function main() {
+  if (process.argv.includes('--list-profiles')) {
+    listProfiles();
+    return;
+  }
+
   const sourceProfile = defaultFirefoxProfileDir();
   const cookies = firefoxCookies(sourceProfile);
 

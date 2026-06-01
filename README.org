@@ -22,6 +22,31 @@ npm install
 npx playwright install firefox
 #+end_src
 
+* Configuration
+
+Useful environment variables:
+
+#+begin_src sh
+FIREFOX_PROFILE_DIR=/path/to/profile
+FIREFOX_PROFILES_INI=/path/to/profiles.ini
+FIREFOX_EXECUTABLE=/path/to/playwright/firefox
+CODEX_BALANCE_TIMEOUT_MS=8000 ./codex-balance.js
+#+end_src
+
+To inspect Firefox profiles and see which ones have ChatGPT/OpenAI cookies:
+
+#+begin_src sh
+./codex-balance.js --list-profiles
+#+end_src
+
+The profile list checks both the regular Firefox location and the Firefox Snap location when present.
+
+Use the reported profile path with =FIREFOX_PROFILE_DIR= if the automatically selected profile is not the one signed in to ChatGPT.
+
+#+begin_src sh
+FIREFOX_PROFILE_DIR=/path/to/profile ./codex-balance.js
+#+end_src
+
 * Usage
 
 #+begin_src sh
@@ -41,15 +66,21 @@ interval = 600
 
 Then add =codex-balance= to your Polybar module list.
 
-* Configuration
+* i3status Example
 
-Useful environment variables:
+I recommend running the query via cron and store the result in a file
+that i3status reads:
 
-#+begin_src sh
-FIREFOX_PROFILE_DIR=/path/to/profile ./codex-balance.js
-FIREFOX_PROFILES_INI=/path/to/profiles.ini ./codex-balance.js
-FIREFOX_EXECUTABLE=/path/to/playwright/firefox ./codex-balance.js
-CODEX_BALANCE_TIMEOUT_MS=8000 ./codex-balance.js
+#+begin_src conf
+*/5 * * * * /bin/bash -c 'FIREFOX_PROFILE_DIR="~/.mozilla/firefox/..." path/to/codex-balance.js > ~/.balance.txt'
+#+end_src
+
+#+begin_src conf
+order += "read_file balance"
+
+read_file balance {
+  path = "~/.balance.txt"
+}
 #+end_src
 
 * Security Notes
