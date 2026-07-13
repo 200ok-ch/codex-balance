@@ -55,6 +55,8 @@ FIREFOX_PROFILE_DIR=/path/to/profile ./codex-balance.js
 
 Each invocation performs a live headless Firefox refresh. Poll every 10 minutes from your status bar or scheduler to keep runtime and network usage low.
 
+If the account does not currently have one of these usage windows, its value is printed as =n/a=.
+
 * Polybar Example
 
 #+begin_src conf

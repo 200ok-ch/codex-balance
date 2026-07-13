@@ -254,7 +254,7 @@ function normalizeWhitespace(text) {
 }
 
 function formatBalances({ fiveHour, weekly }) {
-  return `5h: ${fiveHour} | week: ${weekly}`;
+  return `5h: ${fiveHour || 'n/a'} | week: ${weekly || 'n/a'}`;
 }
 
 function percent(value) {
@@ -264,6 +264,19 @@ function percent(value) {
 }
 
 function parseUsageJson(json) {
+  const windows = [json?.rate_limit?.primary_window, json?.rate_limit?.secondary_window].filter(Boolean);
+  const remainingForDuration = (seconds) => {
+    const window = windows.find((candidate) => candidate.limit_window_seconds === seconds);
+    if (typeof window?.used_percent !== 'number') return null;
+    return percent(Math.max(0, 100 - window.used_percent));
+  };
+  const balances = {
+    fiveHour: remainingForDuration(5 * 60 * 60),
+    weekly: remainingForDuration(7 * 24 * 60 * 60),
+  };
+
+  if (balances.fiveHour || balances.weekly) return balances;
+
   const text = JSON.stringify(json);
   const fiveHour = text.match(/"(?:remaining_percentage|remaining_percent|percent_remaining|percentage_remaining|remaining)"\s*:\s*(\d+(?:\.\d+)?).*?"(?:5h|5_hour|five_hour|fiveHour|five hour)/i)?.[1];
   const weekly = text.match(/"(?:remaining_percentage|remaining_percent|percent_remaining|percentage_remaining|remaining)"\s*:\s*(\d+(?:\.\d+)?).*?"(?:weekly|week)/i)?.[1];
@@ -335,7 +348,7 @@ async function extractBalances(page) {
   const fiveHour = bodyText.match(/5\s*hour\s+usage\s+limit\s+(\d+%)\s+remaining/i)?.[1];
   const weekly = bodyText.match(/Weekly\s+usage\s+limit\s+(\d+%)\s+remaining/i)?.[1];
 
-  if (!fiveHour || !weekly) {
+  if (!fiveHour && !weekly) {
     throw new Error('Could not parse balance values from the Codex analytics page.');
   }
 
