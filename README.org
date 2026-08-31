@@ -1,11 +1,11 @@
 #+TITLE: codex-balance
 
-Print the remaining Codex 5-hour and weekly usage limits for status bars, shell scripts, and small desktop widgets.
+Print the remaining Codex weekly usage limit for status bars, shell scripts, and small desktop widgets.
 
 This is for people who want their current Codex balance visible at a glance instead of manually refreshing the Codex analytics page throughout the day.
 
 #+begin_src text
-5h: 94% | week: 95%
+week: 95%
 #+end_src
 
 * Requirements
@@ -55,7 +55,7 @@ FIREFOX_PROFILE_DIR=/path/to/profile ./codex-balance.js
 
 Each invocation performs a live headless Firefox refresh. Poll every 10 minutes from your status bar or scheduler to keep runtime and network usage low.
 
-If the account does not currently have one of these usage windows, its value is printed as =n/a=.
+If the account does not currently have a weekly usage window, its value is printed as =n/a=.
 
 * Polybar Example
 
