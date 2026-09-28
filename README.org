@@ -4,14 +4,14 @@ Print remaining usage limits for status bars, shell scripts, and small desktop w
 
 Supported providers (select with =BALANCE_PROVIDER= or =--provider=, default =all=):
 
-- =all= — compact one-liner for polybar: =C <codex week> | Z <z.ai 5h>/<z.ai week>=.
+- =all= — compact one-liner for polybar: =C <codex week> | Z <z.ai 5h>/<z.ai week> | O <go 5h>/<go week>/<go month>=.
 - =codex= — remaining Codex weekly usage limit (headless Firefox + ChatGPT login).
 - =zai= — remaining Z.ai GLM Coding Plan 5-hour and weekly quotas (API key).
+- =opencode= — remaining OpenCode Go rolling (5h), weekly, and monthly usage (headless Firefox + opencode.ai login).
 
 This is for people who want their current balance visible at a glance instead of manually refreshing analytics pages throughout the day.
-
 #+begin_src text
-C 97% | Z 99%/39%
+C 97% | Z 99%/39% | O 98%/99%/98%
 #+end_src
 
 Per-provider output:
@@ -19,14 +19,17 @@ Per-provider output:
 #+begin_src text
 week: 97%
 5h: 99% | week: 39%
+5h: 98% | week: 99% | month: 98%
 #+end_src
 
 * Requirements
 
 - Node.js 20 or newer
-- Firefox with an active ChatGPT login
-- =sqlite3=, used to read Firefox's cookie database
-- Playwright Firefox browser binaries
+- Firefox with an active ChatGPT login (codex provider)
+- Firefox with an active opencode.ai login (opencode provider)
+- =sqlite3=, used to read Firefox's cookie database (codex, opencode providers)
+- Playwright Firefox browser binaries (codex, opencode providers)
+- A Z.ai API key (zai provider)
 
 Install the JavaScript dependency and browser binary:
 
@@ -45,14 +48,20 @@ FIREFOX_PROFILES_INI=/path/to/profiles.ini
 FIREFOX_EXECUTABLE=/path/to/playwright/firefox
 BALANCE_PROVIDER=zai
 ZAI_API_KEY=your-zai-api-key
+OPENCODE_ORG=org_0123456789ABCDEFGHIJKLMNPQ
 BALANCE_TIMEOUT_MS=8000 ./codex-balance.js
 #+end_src
 
 =BALANCE_TIMEOUT_MS= takes precedence; the old =CODEX_BALANCE_TIMEOUT_MS= still works.
 
+The codex provider scrapes the Codex analytics page in a headless Firefox using your ChatGPT cookies — no OAuth tokens, no direct API calls, just what your own browser session can already see.
+
+The opencode provider works the same way against your opencode.ai console session: it resolves your org via =/console/api/orgs= (no hardcoded org id in the URL you configure), then reads the Rolling/Weekly/Monthly meters off the Go page. Set =OPENCODE_ORG= to skip org discovery.
+
 Z.ai keys are read from =ZAI_API_KEY=, then =GLM_API_KEY=, then your omp/opencode sign-in (=$XDG_DATA_HOME/opencode/auth.json=, =zai-coding-plan= entry), then =~/.config/openusage/zai.json= (={"apiKey":"…"}=), then =~/.config/zai/key.json=. Get a key from the [[https://z.ai/manage-apikey/apikey-list][Z.ai console]].
 
 #+begin_src sh
+./codex-balance.js --provider opencode
 ./codex-balance.js --provider zai
 ./codex-balance.js --help
 #+end_src
@@ -60,7 +69,7 @@ Z.ai keys are read from =ZAI_API_KEY=, then =GLM_API_KEY=, then your omp/opencod
 To inspect Firefox profiles and see which ones have ChatGPT/OpenAI cookies:
 
 #+begin_src sh
-./codex-balance.js --list-profiles
+./codex-balance.js --list-profiles --provider codex
 #+end_src
 
 The profile list checks both the regular Firefox location and the Firefox Snap location when present.
@@ -68,18 +77,18 @@ The profile list checks both the regular Firefox location and the Firefox Snap l
 Use the reported profile path with =FIREFOX_PROFILE_DIR= if the automatically selected profile is not the one signed in to ChatGPT.
 
 #+begin_src sh
-FIREFOX_PROFILE_DIR=/path/to/profile ./codex-balance.js
+FIREFOX_PROFILE_DIR=/path/to/profile ./codex-balance.js --provider codex
 #+end_src
 
 * Usage
 
 #+begin_src sh
-./codex-balance.js                  # both providers, one line
+./codex-balance.js                  # all providers, one line
 ./codex-balance.js --provider codex
 BALANCE_PROVIDER=zai ./codex-balance.js
 #+end_src
 
-The codex provider performs a live headless Firefox refresh each invocation. Poll every 10 minutes from your status bar or scheduler to keep runtime and network usage low.
+The codex and opencode providers perform a live headless Firefox refresh each invocation. Poll every 10 minutes from your status bar or scheduler to keep runtime and network usage low.
 
 If the account does not currently have a weekly usage window, its value is printed as =n/a=.
 
@@ -92,7 +101,7 @@ exec = /path/to/codex-balance/codex-balance.js
 interval = 600
 #+end_src
 
-Then add =codex-balance= to your Polybar module list. The default =all= provider prints a compact one-liner (=C= codex week, =Z= z.ai 5h/week) that fits a single polybar module.
+Then add =codex-balance= to your Polybar module list. The default =all= provider prints a compact one-liner (=C= codex week, =Z= z.ai 5h/week, =O= OpenCode Go 5h/week/month) that fits a single polybar module.
 
 * i3status Example
 
@@ -100,7 +109,7 @@ I recommend running the query via cron and store the result in a file
 that i3status reads:
 
 #+begin_src conf
-*/5 * * * * /bin/bash -c 'FIREFOX_PROFILE_DIR="~/.mozilla/firefox/..." path/to/codex-balance.js > ~/.balance.txt'
+*/10 * * * * /bin/bash -c 'FIREFOX_PROFILE_DIR="~/.mozilla/firefox/..." path/to/codex-balance.js > ~/.balance.txt'
 #+end_src
 
 #+begin_src conf
@@ -113,6 +122,6 @@ read_file balance {
 
 * Security Notes
 
-This script reads ChatGPT/OpenAI cookies from your Firefox profile and injects them into a fresh headless Playwright Firefox context. It does not open or lock your live Firefox profile.
+The codex and opencode providers read site cookies from your Firefox profile and inject them into a fresh headless Playwright Firefox context. They do not open or lock your live Firefox profile.
 
 The =zai= provider sends your API key only to =https://api.z.ai/api/monitor/usage/quota/limit= (the same endpoint Z.ai's own usage page uses). Prefer =ZAI_API_KEY= over key files, and never commit the key.

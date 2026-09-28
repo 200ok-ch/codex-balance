@@ -8,6 +8,8 @@ const { execFileSync } = require('child_process');
 const PROVIDER = String(process.env.BALANCE_PROVIDER || 'all').toLowerCase();
 const CODEX_URL = 'https://chatgpt.com/codex/cloud/settings/analytics';
 const ZAI_QUOTA_URL = 'https://api.z.ai/api/monitor/usage/quota/limit';
+const OPENCODE_CONSOLE = 'https://opencode.ai/console';
+const OPENCODE_ORG = process.env.OPENCODE_ORG || null;
 const TIMEOUT_MS = Number(process.env.BALANCE_TIMEOUT_MS || process.env.CODEX_BALANCE_TIMEOUT_MS || 6000);
 const DEFAULT_PROFILE_INIS = [
   path.join(os.homedir(), '.mozilla', 'firefox', 'profiles.ini'),
@@ -113,19 +115,20 @@ function firefoxProfiles(profileIni = PROFILE_INI) {
     });
 }
 
-function chatgptCookieHosts(profileDir) {
+function cookieHosts(profileDir, domains) {
   const source = path.join(profileDir, 'cookies.sqlite');
   if (!fs.existsSync(source)) return [];
 
   const copied = copyCookieDatabase(profileDir);
   try {
     const now = Math.floor(Date.now() / 1000);
+    const where = domains.map((domain) => `host like '%${domain.replace(/'/g, "''")}'`).join(' or ');
     const output = execFileSync('sqlite3', [
       '-json',
       copied.database,
       `select distinct host
        from moz_cookies
-       where (host like '%chatgpt.com' or host like '%openai.com')
+       where (${where})
          and (expiry = 0 or expiry > ${now})
        order by host`,
     ], { encoding: 'utf8', maxBuffer: 1024 * 1024 });
@@ -134,6 +137,14 @@ function chatgptCookieHosts(profileDir) {
   } finally {
     fs.rmSync(copied.tmpRoot, { recursive: true, force: true });
   }
+}
+
+function chatgptCookieHosts(profileDir) {
+  return cookieHosts(profileDir, ['chatgpt.com', 'openai.com']);
+}
+
+function opencodeCookieHosts(profileDir) {
+  return cookieHosts(profileDir, ['opencode.ai']);
 }
 
 function listProfiles() {
@@ -206,19 +217,20 @@ function copyCookieDatabase(profileDir) {
   return { tmpRoot, database: target };
 }
 
-function firefoxCookies(profileDir) {
+function firefoxCookies(profileDir, { domains, requireDomain, missingHelp } = { domains: ['chatgpt.com', 'openai.com'] }) {
   const copied = copyCookieDatabase(profileDir);
 
   try {
     const now = Math.floor(Date.now() / 1000);
     let output;
     try {
+      const where = (domains || []).map((domain) => `host like '%${domain.replace(/'/g, "''")}'`).join(' or ');
       output = execFileSync('sqlite3', [
         '-json',
         copied.database,
         `select name, value, host, path, expiry, isSecure, isHttpOnly
          from moz_cookies
-         where (host like '%chatgpt.com' or host like '%openai.com')
+         where (${where})
            and (expiry = 0 or expiry > ${now})`,
       ], { encoding: 'utf8', maxBuffer: 1024 * 1024 });
     } catch (error) {
@@ -241,8 +253,9 @@ function firefoxCookies(profileDir) {
       };
     });
 
-    if (!cookies.some((cookie) => cookie.domain.includes('chatgpt.com'))) {
-      throw new Error(`No chatgpt.com cookies found in the selected Firefox profile. Sign in to ChatGPT in Firefox first, or set FIREFOX_PROFILE_DIR to a Firefox profile that is signed in to ChatGPT.`);
+    const required = requireDomain || 'chatgpt.com';
+    if (!cookies.some((cookie) => cookie.domain.includes(required))) {
+      throw new Error(missingHelp || `No ${required} cookies found in the selected Firefox profile. Sign in to ChatGPT in Firefox first, or set FIREFOX_PROFILE_DIR to a Firefox profile that is signed in to ChatGPT.`);
     }
 
     return cookies;
@@ -436,37 +449,98 @@ async function extractBalances(page) {
   return { weekly };
 }
 
+async function launchWithCookies(cookies) {
+  const { playwright, source } = loadPlaywright();
+  const { firefox } = playwright;
+  const executablePath = FIREFOX_EXECUTABLE || (source === 'system' ? installedPlaywrightFirefoxExecutable() : undefined);
+
+  const launchOptions = {
+    headless: true,
+    timeout: TIMEOUT_MS,
+  };
+  if (executablePath) launchOptions.executablePath = executablePath;
+
+  const browser = await firefox.launch(launchOptions);
+  const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
+  await context.addCookies(cookies);
+  return { browser, context, page: await context.newPage() };
+}
+
 async function fetchCodexBalance() {
   const sourceProfile = defaultFirefoxProfileDir();
   const cookies = firefoxCookies(sourceProfile);
 
-  const { playwright, source } = loadPlaywright();
-  const { firefox } = playwright;
-  const executablePath = FIREFOX_EXECUTABLE || (source === 'system' ? installedPlaywrightFirefoxExecutable() : undefined);
   let browser;
 
   try {
-    const launchOptions = {
-      headless: true,
-      timeout: TIMEOUT_MS,
-    };
-    if (executablePath) launchOptions.executablePath = executablePath;
-
-    browser = await firefox.launch(launchOptions);
-
-    const context = await browser.newContext({ viewport: { width: 1280, height: 900 } });
-    await context.addCookies(cookies);
-    const page = await context.newPage();
-    const { weekly } = await extractBalances(page);
+    const launched = await launchWithCookies(cookies);
+    browser = launched.browser;
+    const { weekly } = await extractBalances(launched.page);
     return { weekly };
   } finally {
     if (browser) await browser.close().catch(() => {});
   }
 }
 
+function opencodeRemaining(usedPercent) {
+  if (typeof usedPercent !== 'number') return null;
+  return percent(Math.max(0, Math.min(100, 100 - usedPercent)));
+}
+
+async function fetchOpencodeBalance() {
+  const sourceProfile = defaultFirefoxProfileDir();
+  const cookies = firefoxCookies(sourceProfile, {
+    domains: ['opencode.ai'],
+    requireDomain: 'opencode.ai',
+    missingHelp: 'No opencode.ai cookies found in the selected Firefox profile. Sign in to opencode.ai in Firefox first, or set FIREFOX_PROFILE_DIR to a Firefox profile that is signed in.',
+  });
+
+  let browser;
+
+  try {
+    const launched = await launchWithCookies(cookies);
+    browser = launched.browser;
+    const { page, context } = launched;
+    // The org id is part of the route (/console/<orgId>/go). OPENCODE_ORG skips
+    // discovery; otherwise resolve it via the orgs API (no navigation), then load
+    // the Go page on a fresh page — re-navigating the same page races the SPA
+    // router and aborts (NS_BINDING_ABORTED).
+    let goPage = page;
+    let orgId = OPENCODE_ORG;
+    if (!orgId) {
+      await page.goto(`${OPENCODE_CONSOLE}/`, { waitUntil: 'domcontentloaded', timeout: TIMEOUT_MS });
+      const orgs = await page.evaluate(async () => {
+        const resp = await fetch('/console/api/orgs', { headers: { Accept: 'application/json' } });
+        if (!resp.ok) throw new Error(`opencode org lookup failed with HTTP ${resp.status}.`);
+        return resp.json();
+      });
+      orgId = (Array.isArray(orgs) ? orgs[0]?.id : orgs?.orgs?.[0]?.id || orgs?.id) || null;
+      if (!orgId) throw new Error('No opencode org found. Set OPENCODE_ORG to your org id.');
+      await page.close();
+      goPage = await context.newPage();
+    }
+    await goPage.goto(`${OPENCODE_CONSOLE}/${orgId}/go`, { waitUntil: 'domcontentloaded', timeout: TIMEOUT_MS });
+    await goPage.getByText('Rolling usage', { exact: false }).waitFor({ timeout: TIMEOUT_MS * 2 });
+    const bodyText = normalizeWhitespace(await goPage.locator('body').innerText({ timeout: TIMEOUT_MS }));
+    // Page renders used percentages ("Rolling usage 2%"); remaining = 100 - used.
+    const fiveHourUsed = bodyText.match(/Rolling usage (\d+(?:\.\d+)?)%/)?.[1];
+    const weeklyUsed = bodyText.match(/Weekly usage (\d+(?:\.\d+)?)%/)?.[1];
+    const monthlyUsed = bodyText.match(/Monthly usage (\d+(?:\.\d+)?)%/)?.[1];
+    const fiveHour = fiveHourUsed === undefined ? null : opencodeRemaining(Number(fiveHourUsed));
+    const weekly = weeklyUsed === undefined ? null : opencodeRemaining(Number(weeklyUsed));
+    const monthly = monthlyUsed === undefined ? null : opencodeRemaining(Number(monthlyUsed));
+    if (!fiveHour && !weekly && !monthly) {
+      throw new Error('Could not parse usage meters from the opencode Go page. Check that Firefox is signed in to opencode.ai and the Go subscription is active.');
+    }
+    return { fiveHour, weekly, monthly };
+  } finally {
+    if (browser) await browser.close().catch(() => {});
+  }
+}
+
 async function runAll() {
-  const [codex, zai] = await Promise.all([fetchCodexBalance(), fetchZaiBalance()]);
-  console.log(`C ${codex.weekly || 'n/a'} | Z ${zai.fiveHour || 'n/a'}/${zai.weekly || 'n/a'}`);
+  const [codex, zai, opencode] = await Promise.all([fetchCodexBalance(), fetchZaiBalance(), fetchOpencodeBalance()]);
+  console.log(`C ${codex.weekly || 'n/a'} | Z ${zai.fiveHour || 'n/a'}/${zai.weekly || 'n/a'} | O ${opencode.fiveHour || 'n/a'}/${opencode.weekly || 'n/a'}/${opencode.monthly || 'n/a'}`);
 }
 
 async function runZai() {
@@ -474,14 +548,20 @@ async function runZai() {
   console.log(formatZaiBalance({ fiveHour, weekly }));
 }
 
+async function runOpencode() {
+  const { fiveHour, weekly, monthly } = await fetchOpencodeBalance();
+  console.log(`5h: ${fiveHour || 'n/a'} | week: ${weekly || 'n/a'} | month: ${monthly || 'n/a'}`);
+}
+
 async function main() {
   if (process.argv.includes('--help') || process.argv.includes('-h')) {
-    console.log('Usage: codex-balance.js [--list-profiles] [--provider codex|zai|all]');
+    console.log('Usage: codex-balance.js [--list-profiles] [--provider codex|zai|opencode|all]');
     console.log('');
     console.log('Providers (BALANCE_PROVIDER, default all):');
-    console.log('  codex  Weekly Codex limit via headless Firefox (ChatGPT login required).');
-    console.log('  zai    Z.ai 5h + weekly GLM Coding Plan quotas via API key (ZAI_API_KEY).');
-    console.log('  all    Compact one-liner for polybar: C <week> | Z <5h>/<week>.');
+    console.log('  codex     Weekly Codex limit via headless Firefox (ChatGPT login required).');
+    console.log('  zai       Z.ai 5h + weekly GLM Coding Plan quotas via API key (ZAI_API_KEY).');
+    console.log('  opencode  OpenCode Go 5h + weekly + monthly meters via headless Firefox (opencode.ai login).');
+    console.log('  all       Compact one-liner for polybar: C <week> | Z <5h>/<week> | O <5h>/<week>/<month>.');
     return;
   }
   const flag = process.argv.indexOf('--provider');
@@ -496,7 +576,12 @@ async function main() {
     await runZai();
     return;
   }
-  if (provider !== 'codex') throw new Error(`Unknown provider "${provider}". Use --provider codex|zai|all.`);
+  if (provider === 'opencode') {
+    if (process.argv.includes('--list-profiles')) throw new Error('--list-profiles only applies to the codex provider.');
+    await runOpencode();
+    return;
+  }
+  if (provider !== 'codex') throw new Error(`Unknown provider "${provider}". Use --provider codex|zai|opencode|all.`);
   if (process.argv.includes('--list-profiles')) {
     listProfiles();
     return;
