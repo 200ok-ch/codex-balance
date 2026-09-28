@@ -5,8 +5,10 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
+const PROVIDER = String(process.env.BALANCE_PROVIDER || 'all').toLowerCase();
 const CODEX_URL = 'https://chatgpt.com/codex/cloud/settings/analytics';
-const TIMEOUT_MS = Number(process.env.CODEX_BALANCE_TIMEOUT_MS || 6000);
+const ZAI_QUOTA_URL = 'https://api.z.ai/api/monitor/usage/quota/limit';
+const TIMEOUT_MS = Number(process.env.BALANCE_TIMEOUT_MS || process.env.CODEX_BALANCE_TIMEOUT_MS || 6000);
 const DEFAULT_PROFILE_INIS = [
   path.join(os.homedir(), '.mozilla', 'firefox', 'profiles.ini'),
   path.join(os.homedir(), 'snap', 'firefox', 'common', '.mozilla', 'firefox', 'profiles.ini'),
@@ -257,12 +259,97 @@ function formatBalance({ weekly }) {
   return `week: ${weekly || 'n/a'}`;
 }
 
+function formatZaiBalance({ fiveHour, weekly }) {
+  return `5h: ${fiveHour || 'n/a'} | week: ${weekly || 'n/a'}`;
+}
 function percent(value) {
   if (typeof value === 'number') return `${Math.round(value)}%`;
   if (typeof value === 'string') return value.endsWith('%') ? value : `${value}%`;
   return null;
 }
 
+function zaiApiKey() {
+  if (process.env.ZAI_API_KEY) return { key: process.env.ZAI_API_KEY, source: 'ZAI_API_KEY' };
+  if (process.env.GLM_API_KEY) return { key: process.env.GLM_API_KEY, source: 'GLM_API_KEY' };
+  const dataHome = process.env.XDG_DATA_HOME || path.join(os.homedir(), '.local', 'share');
+  const candidates = [
+    path.join(dataHome, 'opencode', 'auth.json'),
+    path.join(os.homedir(), '.config', 'openusage', 'zai.json'),
+    path.join(os.homedir(), '.config', 'zai', 'key.json'),
+  ];
+  for (const file of candidates) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(file, 'utf8'));
+      const key = parsed?.apiKey || parsed?.api_key || parsed?.key || parsed?.['zai-coding-plan']?.key;
+      if (key) return { key: String(key), source: file };
+    } catch {
+      // Missing or unparsable; try the next source.
+    }
+  }
+  throw new Error('No Z.ai API key found. Set ZAI_API_KEY (or GLM_API_KEY), sign in via omp/opencode (zai-coding-plan), or add {"apiKey":"…"} to ~/.config/openusage/zai.json.');
+}
+
+function zaiRemaining(entry) {
+  const raw = Number(entry?.percentage);
+  if (Number.isFinite(raw)) return percent(Math.max(0, Math.min(100, 100 - raw)));
+  const remaining = Number(entry?.remaining);
+  const total = Number(entry?.usage);
+  if (Number.isFinite(remaining) && Number.isFinite(total) && total > 0) {
+    return percent(Math.max(0, Math.min(100, (remaining / total) * 100)));
+  }
+  return null;
+}
+
+function zaiWindowMs(unit, number) {
+  const hour = 60 * 60 * 1000;
+  const unitMs = { 3: hour, 4: 24 * hour, 5: 30 * 24 * hour, 6: 7 * 24 * hour }[Number(unit)];
+  if (!unitMs || !(Number(number) > 0)) return null;
+  return unitMs * Number(number);
+}
+
+function parseZaiQuotaJson(json) {
+  if (json && json.success === false && !json.data) {
+    throw new Error('No active GLM Coding Plan for this Z.ai API key. Subscribe at z.ai/subscribe to see usage.');
+  }
+  const container = json?.data && typeof json.data === 'object' ? json.data : json;
+  const limits = container?.limits;
+  if (!Array.isArray(limits)) throw new Error(`Could not parse Z.ai quota response: ${JSON.stringify(json).slice(0, 200)}`);
+  let fiveHour = null;
+  let weekly = null;
+  for (const entry of limits) {
+    const type = entry?.type || entry?.name;
+    if (type !== 'CREDIT_LIMIT' && type !== 'TOKENS_LIMIT') continue;
+    const windowMs = zaiWindowMs(entry?.unit, entry?.number);
+    if (windowMs === null) continue;
+    // Sub-daily window (unit 3, hours) is the 5h quota; multi-day (unit 6, weeks) is weekly.
+    if (windowMs < 24 * 60 * 60 * 1000) fiveHour = fiveHour || zaiRemaining(entry);
+    else weekly = weekly || zaiRemaining(entry);
+  }
+  if (!fiveHour && !weekly) throw new Error(`No 5h or weekly quota in Z.ai response: ${JSON.stringify(json).slice(0, 200)}`);
+  return { fiveHour, weekly };
+}
+
+async function fetchZaiBalance() {
+  const { key } = zaiApiKey();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const response = await fetch(ZAI_QUOTA_URL, {
+      headers: { Authorization: `Bearer ${key}`, Accept: 'application/json' },
+      signal: controller.signal,
+    });
+    if (response.status === 401 || response.status === 403) {
+      throw new Error('Z.ai API key invalid (rejected with ' + response.status + '). Regenerate it at z.ai/manage-apikey/apikey-list.');
+    }
+    if (!response.ok) throw new Error(`Z.ai quota request failed with HTTP ${response.status}.`);
+    return parseZaiQuotaJson(await response.json());
+  } catch (error) {
+    if (error?.name === 'AbortError') throw new Error(`Z.ai quota request timed out after ${TIMEOUT_MS}ms.`);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
 function parseUsageJson(json) {
   const windows = [json?.rate_limit?.primary_window, json?.rate_limit?.secondary_window].filter(Boolean);
   const remainingForDuration = (seconds) => {
@@ -349,12 +436,7 @@ async function extractBalances(page) {
   return { weekly };
 }
 
-async function main() {
-  if (process.argv.includes('--list-profiles')) {
-    listProfiles();
-    return;
-  }
-
+async function fetchCodexBalance() {
   const sourceProfile = defaultFirefoxProfileDir();
   const cookies = firefoxCookies(sourceProfile);
 
@@ -376,10 +458,51 @@ async function main() {
     await context.addCookies(cookies);
     const page = await context.newPage();
     const { weekly } = await extractBalances(page);
-    console.log(formatBalance({ weekly }));
+    return { weekly };
   } finally {
     if (browser) await browser.close().catch(() => {});
   }
+}
+
+async function runAll() {
+  const [codex, zai] = await Promise.all([fetchCodexBalance(), fetchZaiBalance()]);
+  console.log(`C ${codex.weekly || 'n/a'} | Z ${zai.fiveHour || 'n/a'}/${zai.weekly || 'n/a'}`);
+}
+
+async function runZai() {
+  const { fiveHour, weekly } = await fetchZaiBalance();
+  console.log(formatZaiBalance({ fiveHour, weekly }));
+}
+
+async function main() {
+  if (process.argv.includes('--help') || process.argv.includes('-h')) {
+    console.log('Usage: codex-balance.js [--list-profiles] [--provider codex|zai|all]');
+    console.log('');
+    console.log('Providers (BALANCE_PROVIDER, default all):');
+    console.log('  codex  Weekly Codex limit via headless Firefox (ChatGPT login required).');
+    console.log('  zai    Z.ai 5h + weekly GLM Coding Plan quotas via API key (ZAI_API_KEY).');
+    console.log('  all    Compact one-liner for polybar: C <week> | Z <5h>/<week>.');
+    return;
+  }
+  const flag = process.argv.indexOf('--provider');
+  const provider = (flag !== -1 && process.argv[flag + 1] ? process.argv[flag + 1] : PROVIDER).toLowerCase();
+  if (provider === 'all') {
+    if (process.argv.includes('--list-profiles')) throw new Error('--list-profiles only applies to the codex provider.');
+    await runAll();
+    return;
+  }
+  if (provider === 'zai') {
+    if (process.argv.includes('--list-profiles')) throw new Error('--list-profiles only applies to the codex provider.');
+    await runZai();
+    return;
+  }
+  if (provider !== 'codex') throw new Error(`Unknown provider "${provider}". Use --provider codex|zai|all.`);
+  if (process.argv.includes('--list-profiles')) {
+    listProfiles();
+    return;
+  }
+  const { weekly } = await fetchCodexBalance();
+  console.log(formatBalance({ weekly }));
 }
 
 main().catch((error) => {
