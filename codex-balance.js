@@ -8,6 +8,8 @@ const { execFileSync } = require('child_process');
 const PROVIDER = String(process.env.BALANCE_PROVIDER || 'all').toLowerCase();
 const CODEX_URL = 'https://chatgpt.com/codex/cloud/settings/analytics';
 const ZAI_QUOTA_URL = 'https://api.z.ai/api/monitor/usage/quota/limit';
+const CLAUDE_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
+const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
 const OPENCODE_CONSOLE = 'https://opencode.ai/console';
 const OPENCODE_ORG = process.env.OPENCODE_ORG || null;
 const TIMEOUT_MS = Number(process.env.BALANCE_TIMEOUT_MS || process.env.CODEX_BALANCE_TIMEOUT_MS || 6000);
@@ -363,6 +365,68 @@ async function fetchZaiBalance() {
     clearTimeout(timer);
   }
 }
+
+function claudeOauthToken() {
+  if (process.env.CLAUDE_CODE_OAUTH_TOKEN) return process.env.CLAUDE_CODE_OAUTH_TOKEN;
+  const file = path.join(CLAUDE_CONFIG_DIR, '.credentials.json');
+  let oauth;
+  try {
+    oauth = JSON.parse(fs.readFileSync(file, 'utf8'))?.claudeAiOauth;
+  } catch {
+    throw new Error(`No Claude Code credentials at ${file}. Run \`claude\` and log in, or set CLAUDE_CODE_OAUTH_TOKEN.`);
+  }
+  if (!oauth?.accessToken) throw new Error(`No OAuth access token in ${file}. Run \`claude\` and log in with your Claude subscription.`);
+  // Claude Code refreshes the token itself; refreshing here would rotate the refresh token out from under it.
+  if (Number(oauth.expiresAt) && Number(oauth.expiresAt) < Date.now()) {
+    throw new Error('Claude Code OAuth token expired. Run `claude` once to refresh it.');
+  }
+  return oauth.accessToken;
+}
+
+function claudeRemaining(window) {
+  const used = Number(window?.utilization);
+  if (window?.utilization === null || window?.utilization === undefined || !Number.isFinite(used)) return null;
+  return percent(Math.max(0, Math.min(100, 100 - used)));
+}
+
+function parseClaudeUsageJson(json) {
+  const fiveHour = claudeRemaining(json?.five_hour);
+  const weekly = claudeRemaining(json?.seven_day);
+  const opus = claudeRemaining(json?.seven_day_opus);
+  const sonnet = claudeRemaining(json?.seven_day_sonnet);
+  if (!fiveHour && !weekly) throw new Error(`Could not parse Claude usage response: ${JSON.stringify(json).slice(0, 200)}`);
+  return { fiveHour, weekly, opus, sonnet };
+}
+
+async function fetchClaudeBalance() {
+  const token = claudeOauthToken();
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+  try {
+    const response = await fetch(CLAUDE_USAGE_URL, {
+      headers: { Authorization: `Bearer ${token}`, 'anthropic-beta': 'oauth-2025-04-20', Accept: 'application/json' },
+      signal: controller.signal,
+    });
+    if (response.status === 401 || response.status === 403) {
+      throw new Error(`Claude usage request rejected with ${response.status}. Run \`claude\` once to refresh the login.`);
+    }
+    if (!response.ok) throw new Error(`Claude usage request failed with HTTP ${response.status}.`);
+    return parseClaudeUsageJson(await response.json());
+  } catch (error) {
+    if (error?.name === 'AbortError') throw new Error(`Claude usage request timed out after ${TIMEOUT_MS}ms.`);
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function formatClaudeBalance({ fiveHour, weekly, opus, sonnet }) {
+  const parts = [`5h: ${fiveHour || 'n/a'}`, `week: ${weekly || 'n/a'}`];
+  if (opus) parts.push(`opus week: ${opus}`);
+  if (sonnet) parts.push(`sonnet week: ${sonnet}`);
+  return parts.join(' | ');
+}
+
 function parseUsageJson(json) {
   const windows = [json?.rate_limit?.primary_window, json?.rate_limit?.secondary_window].filter(Boolean);
   const remainingForDuration = (seconds) => {
@@ -538,56 +602,85 @@ async function fetchOpencodeBalance() {
   }
 }
 
-async function runAll() {
-  const [codex, zai, opencode] = await Promise.all([fetchCodexBalance(), fetchZaiBalance(), fetchOpencodeBalance()]);
-  console.log(`C ${codex.weekly || 'n/a'} | Z ${zai.fiveHour || 'n/a'}/${zai.weekly || 'n/a'} | O ${opencode.fiveHour || 'n/a'}/${opencode.weekly || 'n/a'}/${opencode.monthly || 'n/a'}`);
+const PROVIDERS = {
+  codex: {
+    label: 'C',
+    fetch: fetchCodexBalance,
+    format: formatBalance,
+    compact: ({ weekly }) => weekly || 'n/a',
+  },
+  zai: {
+    label: 'Z',
+    fetch: fetchZaiBalance,
+    format: formatZaiBalance,
+    compact: ({ fiveHour, weekly }) => `${fiveHour || 'n/a'}/${weekly || 'n/a'}`,
+  },
+  opencode: {
+    label: 'O',
+    fetch: fetchOpencodeBalance,
+    format: ({ fiveHour, weekly, monthly }) => `5h: ${fiveHour || 'n/a'} | week: ${weekly || 'n/a'} | month: ${monthly || 'n/a'}`,
+    compact: ({ fiveHour, weekly, monthly }) => `${fiveHour || 'n/a'}/${weekly || 'n/a'}/${monthly || 'n/a'}`,
+  },
+  claude: {
+    label: 'CC',
+    fetch: fetchClaudeBalance,
+    format: formatClaudeBalance,
+    compact: ({ fiveHour, weekly }) => `${fiveHour || 'n/a'}/${weekly || 'n/a'}`,
+  },
+};
+
+function selectedProviders() {
+  const flag = process.argv.indexOf('--provider');
+  const raw = flag !== -1 && process.argv[flag + 1] ? process.argv[flag + 1] : PROVIDER;
+  const names = raw.toLowerCase().split(',').map((name) => name.trim()).filter(Boolean);
+  const expanded = names.flatMap((name) => (name === 'all' ? Object.keys(PROVIDERS) : [name]));
+  const unknown = expanded.find((name) => !PROVIDERS[name]);
+  if (unknown || !expanded.length) {
+    throw new Error(`Unknown provider "${unknown || raw}". Use --provider ${Object.keys(PROVIDERS).join('|')}|all, or a comma-separated list.`);
+  }
+  return { names: [...new Set(expanded)], combined: names.length > 1 || names.includes('all') };
 }
 
-async function runZai() {
-  const { fiveHour, weekly } = await fetchZaiBalance();
-  console.log(formatZaiBalance({ fiveHour, weekly }));
-}
-
-async function runOpencode() {
-  const { fiveHour, weekly, monthly } = await fetchOpencodeBalance();
-  console.log(`5h: ${fiveHour || 'n/a'} | week: ${weekly || 'n/a'} | month: ${monthly || 'n/a'}`);
+// Compact one-liner; a failing provider prints "?" (reason on stderr) instead of hiding the others.
+async function runCombined(names) {
+  const results = await Promise.allSettled(names.map((name) => PROVIDERS[name].fetch()));
+  const parts = results.map((result, index) => {
+    const provider = PROVIDERS[names[index]];
+    if (result.status === 'fulfilled') return `${provider.label} ${provider.compact(result.value)}`;
+    console.error(`codex-balance: ${names[index]}: ${result.reason?.message || result.reason}`);
+    return `${provider.label} ?`;
+  });
+  console.log(parts.join(' | '));
+  if (results.every((result) => result.status === 'rejected')) process.exitCode = 1;
 }
 
 async function main() {
   if (process.argv.includes('--help') || process.argv.includes('-h')) {
-    console.log('Usage: codex-balance.js [--list-profiles] [--provider codex|zai|opencode|all]');
+    console.log('Usage: codex-balance.js [--list-profiles] [--provider <name>[,<name>...]]');
     console.log('');
-    console.log('Providers (BALANCE_PROVIDER, default all):');
+    console.log('Providers (--provider or BALANCE_PROVIDER, default all):');
     console.log('  codex     Weekly Codex limit via headless Firefox (ChatGPT login required).');
     console.log('  zai       Z.ai 5h + weekly GLM Coding Plan quotas via API key (ZAI_API_KEY).');
     console.log('  opencode  OpenCode Go 5h + weekly + monthly meters via headless Firefox (opencode.ai login).');
-    console.log('  all       Compact one-liner for polybar: C <week> | Z <5h>/<week> | O <5h>/<week>/<month>.');
+    console.log('  claude    Claude Code 5h + weekly limits via your Claude Code login (~/.claude/.credentials.json).');
+    console.log('  all       Every provider on one line.');
+    console.log('');
+    console.log('Several providers (e.g. --provider claude,zai) print a compact line in the given order:');
+    console.log('  C <week> | Z <5h>/<week> | O <5h>/<week>/<month> | CC <5h>/<week>');
     return;
   }
-  const flag = process.argv.indexOf('--provider');
-  const provider = (flag !== -1 && process.argv[flag + 1] ? process.argv[flag + 1] : PROVIDER).toLowerCase();
-  if (provider === 'all') {
-    if (process.argv.includes('--list-profiles')) throw new Error('--list-profiles only applies to the codex provider.');
-    await runAll();
-    return;
-  }
-  if (provider === 'zai') {
-    if (process.argv.includes('--list-profiles')) throw new Error('--list-profiles only applies to the codex provider.');
-    await runZai();
-    return;
-  }
-  if (provider === 'opencode') {
-    if (process.argv.includes('--list-profiles')) throw new Error('--list-profiles only applies to the codex provider.');
-    await runOpencode();
-    return;
-  }
-  if (provider !== 'codex') throw new Error(`Unknown provider "${provider}". Use --provider codex|zai|opencode|all.`);
+  const { names, combined } = selectedProviders();
   if (process.argv.includes('--list-profiles')) {
+    if (combined || names[0] !== 'codex') throw new Error('--list-profiles only applies to the codex provider.');
     listProfiles();
     return;
   }
-  const { weekly } = await fetchCodexBalance();
-  console.log(formatBalance({ weekly }));
+  if (combined) {
+    await runCombined(names);
+    return;
+  }
+  const provider = PROVIDERS[names[0]];
+  console.log(provider.format(await provider.fetch()));
 }
 
 main().catch((error) => {

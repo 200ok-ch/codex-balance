@@ -2,16 +2,25 @@
 
 Print remaining usage limits for status bars, shell scripts, and small desktop widgets.
 
-Supported providers (select with =BALANCE_PROVIDER= or =--provider=, default =all=):
+Supported providers (select with =--provider= or =BALANCE_PROVIDER=, default =all=):
 
-- =all= — compact one-liner for polybar: =C <codex week> | Z <z.ai 5h>/<z.ai week> | O <go 5h>/<go week>/<go month>=.
+- =all= — every provider on one compact line for polybar: =C <codex week> | Z <z.ai 5h>/<z.ai week> | O <go 5h>/<go week>/<go month> | CC <claude 5h>/<claude week>=.
 - =codex= — remaining Codex weekly usage limit (headless Firefox + ChatGPT login).
 - =zai= — remaining Z.ai GLM Coding Plan 5-hour and weekly quotas (API key).
 - =opencode= — remaining OpenCode Go rolling (5h), weekly, and monthly usage (headless Firefox + opencode.ai login).
+- =claude= — remaining Claude Code 5-hour and weekly limits (your Claude Code login, no browser).
+
+Pass a comma-separated list to pick which providers appear on the compact line, and in which order:
+
+#+begin_src sh
+./codex-balance.js --provider claude,zai     # CC 97%/100% | Z 71%/87%
+#+end_src
+
+On the compact line, a provider that fails prints =?= (the reason goes to stderr) so the others still show.
 
 This is for people who want their current balance visible at a glance instead of manually refreshing analytics pages throughout the day.
 #+begin_src text
-C 97% | Z 99%/39% | O 98%/99%/98%
+C 97% | Z 99%/39% | O 98%/99%/98% | CC 97%/100%
 #+end_src
 
 Per-provider output:
@@ -20,6 +29,7 @@ Per-provider output:
 week: 97%
 5h: 99% | week: 39%
 5h: 98% | week: 99% | month: 98%
+5h: 97% | week: 100%
 #+end_src
 
 * Requirements
@@ -30,6 +40,7 @@ week: 97%
 - =sqlite3=, used to read Firefox's cookie database (codex, opencode providers)
 - Playwright Firefox browser binaries (codex, opencode providers)
 - A Z.ai API key (zai provider)
+- Claude Code, logged in with a Claude subscription (claude provider)
 
 Install the JavaScript dependency and browser binary:
 
@@ -49,6 +60,8 @@ FIREFOX_EXECUTABLE=/path/to/playwright/firefox
 BALANCE_PROVIDER=zai
 ZAI_API_KEY=your-zai-api-key
 OPENCODE_ORG=org_0123456789ABCDEFGHIJKLMNPQ
+CLAUDE_CONFIG_DIR=~/.claude
+CLAUDE_CODE_OAUTH_TOKEN=your-claude-oauth-token
 BALANCE_TIMEOUT_MS=8000 ./codex-balance.js
 #+end_src
 
@@ -60,7 +73,10 @@ The opencode provider works the same way against your opencode.ai console sessio
 
 Z.ai keys are read from =ZAI_API_KEY=, then =GLM_API_KEY=, then your omp/opencode sign-in (=$XDG_DATA_HOME/opencode/auth.json=, =zai-coding-plan= entry), then =~/.config/openusage/zai.json= (={"apiKey":"…"}=), then =~/.config/zai/key.json=. Get a key from the [[https://z.ai/manage-apikey/apikey-list][Z.ai console]].
 
+The claude provider reads the OAuth access token Claude Code stores in =$CLAUDE_CONFIG_DIR/.credentials.json= (default =~/.claude=), or =CLAUDE_CODE_OAUTH_TOKEN= if set, and asks =https://api.anthropic.com/api/oauth/usage= for the same numbers =/usage= shows. The token lasts a few hours and Claude Code refreshes it whenever you use it; this script never refreshes it itself, because that would rotate the refresh token and log Claude Code out. If you haven't used =claude= in a while, run it once. On macOS Claude Code keeps the token in the Keychain, so set =CLAUDE_CODE_OAUTH_TOKEN= there.
+
 #+begin_src sh
+./codex-balance.js --provider claude
 ./codex-balance.js --provider opencode
 ./codex-balance.js --provider zai
 ./codex-balance.js --help
@@ -85,6 +101,7 @@ FIREFOX_PROFILE_DIR=/path/to/profile ./codex-balance.js --provider codex
 #+begin_src sh
 ./codex-balance.js                  # all providers, one line
 ./codex-balance.js --provider codex
+./codex-balance.js --provider claude,codex
 BALANCE_PROVIDER=zai ./codex-balance.js
 #+end_src
 
@@ -101,7 +118,7 @@ exec = /path/to/codex-balance/codex-balance.js
 interval = 600
 #+end_src
 
-Then add =codex-balance= to your Polybar module list. The default =all= provider prints a compact one-liner (=C= codex week, =Z= z.ai 5h/week, =O= OpenCode Go 5h/week/month) that fits a single polybar module.
+Then add =codex-balance= to your Polybar module list. The default =all= provider prints a compact one-liner (=C= codex week, =Z= z.ai 5h/week, =O= OpenCode Go 5h/week/month, =CC= Claude Code 5h/week) that fits a single polybar module. Use =exec = /path/to/codex-balance/codex-balance.js --provider claude,codex= to show only the providers you use.
 
 * i3status Example
 
@@ -125,3 +142,5 @@ read_file balance {
 The codex and opencode providers read site cookies from your Firefox profile and inject them into a fresh headless Playwright Firefox context. They do not open or lock your live Firefox profile.
 
 The =zai= provider sends your API key only to =https://api.z.ai/api/monitor/usage/quota/limit= (the same endpoint Z.ai's own usage page uses). Prefer =ZAI_API_KEY= over key files, and never commit the key.
+
+The =claude= provider sends your Claude Code OAuth access token only to =https://api.anthropic.com/api/oauth/usage=. It reads the credentials file but never writes to it.
