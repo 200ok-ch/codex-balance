@@ -546,9 +546,14 @@ async function fetchCodexBalance() {
   }
 }
 
-function opencodeRemaining(usedPercent) {
-  if (typeof usedPercent !== 'number') return null;
-  return percent(Math.max(0, Math.min(100, 100 - usedPercent)));
+// The Go page has rendered both "Rolling usage 2%" (used) and
+// "Rolling usage 100% left" (remaining); honour the suffix when present.
+function opencodeRemaining(bodyText, label) {
+  const match = bodyText.match(new RegExp(`${label} usage (\\d+(?:\\.\\d+)?)%(\\s+(?:left|remaining))?`, 'i'));
+  if (!match) return null;
+  const value = Number(match[1]);
+  const remaining = match[2] ? value : 100 - value;
+  return percent(Math.max(0, Math.min(100, remaining)));
 }
 
 async function fetchOpencodeBalance() {
@@ -586,13 +591,9 @@ async function fetchOpencodeBalance() {
     await goPage.goto(`${OPENCODE_CONSOLE}/${orgId}/go`, { waitUntil: 'domcontentloaded', timeout: TIMEOUT_MS });
     await goPage.getByText('Rolling usage', { exact: false }).waitFor({ timeout: TIMEOUT_MS * 2 });
     const bodyText = normalizeWhitespace(await goPage.locator('body').innerText({ timeout: TIMEOUT_MS }));
-    // Page renders used percentages ("Rolling usage 2%"); remaining = 100 - used.
-    const fiveHourUsed = bodyText.match(/Rolling usage (\d+(?:\.\d+)?)%/)?.[1];
-    const weeklyUsed = bodyText.match(/Weekly usage (\d+(?:\.\d+)?)%/)?.[1];
-    const monthlyUsed = bodyText.match(/Monthly usage (\d+(?:\.\d+)?)%/)?.[1];
-    const fiveHour = fiveHourUsed === undefined ? null : opencodeRemaining(Number(fiveHourUsed));
-    const weekly = weeklyUsed === undefined ? null : opencodeRemaining(Number(weeklyUsed));
-    const monthly = monthlyUsed === undefined ? null : opencodeRemaining(Number(monthlyUsed));
+    const fiveHour = opencodeRemaining(bodyText, 'Rolling');
+    const weekly = opencodeRemaining(bodyText, 'Weekly');
+    const monthly = opencodeRemaining(bodyText, 'Monthly');
     if (!fiveHour && !weekly && !monthly) {
       throw new Error('Could not parse usage meters from the opencode Go page. Check that Firefox is signed in to opencode.ai and the Go subscription is active.');
     }
