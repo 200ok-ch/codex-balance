@@ -102,6 +102,7 @@ FIREFOX_PROFILE_DIR=/path/to/profile ./codex-balance.js --provider codex
 ./codex-balance.js                  # all providers, one line
 ./codex-balance.js --provider codex
 ./codex-balance.js --provider claude,codex
+./codex-balance.js --stats          # burn rates and projections from the history
 BALANCE_PROVIDER=zai ./codex-balance.js
 #+end_src
 
@@ -140,6 +141,30 @@ sqlite3 -header -column ~/.local/state/codex-balance/history.sqlite \
 #+end_src
 
 Recording never changes the printed balance; if it fails, the reason goes to stderr.
+
+** Stats
+
+=--stats= reads the history (it doesn't fetch anything) and prints, per meter, how fast it is being used and whether it will last until the reset:
+
+#+begin_src text
+$ ./codex-balance.js --stats --provider claude
+claude 5h: 30% left, resets 21:02 (in 3h)
+  pace: 35.0%/h this window (70% used in 2h, 40% of the window), 30.0%/h last hour
+  at this window's pace: runs out 18:53, 2h 9m before reset
+  at last hour pace: runs out 19:02, 2h before reset
+
+claude week: 78% left, resets Oct 7 18:02 (in 6d)
+  pace: 22.2%/day this window (22% used in 23h 50m, 14% of the window), 2.0%/day last 24h
+  at this window's pace: runs out Mon 06:22, 2d 11h before reset
+  at last 24h pace: 66% left at reset
+  past windows used: Sep 19–Sep 26 ≥60%
+#+end_src
+
+- /this window/ is the average since the window started (reset time minus the window length), so it holds across sleep gaps and needs only one sample.
+- /last hour/ (5h windows) or /last 24h/ (weekly and monthly) uses the recorded samples, stopping at the last reset.
+- /past windows used/ lists the last four completed windows. =≥= means the last sample came well before the reset, so later usage wasn't seen.
+
+Meters without a reset time (OpenCode's rolling 5h) only get the recent pace.
 
 * Polybar Example
 

@@ -722,6 +722,161 @@ function recordHistory(results) {
   }
 }
 
+// --stats: burn rates and projections from the recorded history (no fetching).
+const HOUR = 3600;
+const DAY = 24 * HOUR;
+// Fixed windows: usage starts at 0 at (resets_at - length), which gives a pace even across sleep gaps.
+const WINDOW_SECONDS = { '5h': 5 * HOUR, week: 7 * DAY, opus_week: 7 * DAY, sonnet_week: 7 * DAY, month: 30 * DAY };
+// Short windows read in %/h over the last hour; long ones in %/day over the last day.
+const RECENT = { '5h': { span: HOUR, unit: HOUR, label: 'h', recentLabel: 'last hour' } };
+const RECENT_DEFAULT = { span: DAY, unit: DAY, label: 'day', recentLabel: 'last 24h' };
+// OpenCode's resets_at comes from "Resets in 3d 8h", so allow some drift before calling it a new cycle.
+const RESET_TOLERANCE = 2 * HOUR;
+
+function formatDuration(seconds) {
+  const total = Math.max(0, Math.round(seconds / 60));
+  const days = Math.floor(total / 1440);
+  const hours = Math.floor((total % 1440) / 60);
+  const minutes = total % 60;
+  if (days) return hours ? `${days}d ${hours}h` : `${days}d`;
+  if (hours) return minutes ? `${hours}h ${minutes}m` : `${hours}h`;
+  return `${minutes}m`;
+}
+
+function formatTime(unix, now) {
+  const date = new Date(unix * 1000);
+  const time = date.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+  if (new Date(now * 1000).toDateString() === date.toDateString()) return time;
+  if (Math.abs(unix - now) < 6 * DAY) return `${date.toLocaleDateString('en-GB', { weekday: 'short' })} ${time}`;
+  return `${formatDay(unix)} ${time}`;
+}
+
+function formatDay(unix) {
+  return new Date(unix * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+}
+
+function sameCycle(a, b) {
+  if (a.resets_at === null || b.resets_at === null) return a.resets_at === b.resets_at;
+  return Math.abs(a.resets_at - b.resets_at) <= RESET_TOLERANCE;
+}
+
+// Rate over the trailing span, only counting back to the start of the current cycle.
+// A rising remaining value means the meter recovered (rolling window or missed reset).
+function recentRate(samples, span) {
+  const latest = samples[samples.length - 1];
+  let oldest = latest;
+  for (let i = samples.length - 2; i >= 0; i -= 1) {
+    const sample = samples[i];
+    const newer = samples[i + 1];
+    if (latest.created_at - sample.created_at > span) break;
+    if (!sameCycle(sample, latest) || sample.remaining_pct < newer.remaining_pct - 0.5) break;
+    oldest = sample;
+  }
+  const elapsed = latest.created_at - oldest.created_at;
+  if (elapsed < 15 * 60) return null;
+  return { rate: (oldest.remaining_pct - latest.remaining_pct) / elapsed, elapsed };
+}
+
+// Completed cycles, oldest first, with how much of the limit they used.
+function pastCycles(samples, windowSeconds, now) {
+  const cycles = [];
+  for (const sample of samples) {
+    if (sample.resets_at === null) continue;
+    const current = cycles[cycles.length - 1];
+    if (current && sameCycle(current.last, sample)) {
+      current.last = sample;
+      current.minRemaining = Math.min(current.minRemaining, sample.remaining_pct);
+    } else {
+      cycles.push({ last: sample, minRemaining: sample.remaining_pct });
+    }
+  }
+  return cycles
+    .filter((cycle) => cycle.last.resets_at <= now)
+    .map((cycle) => ({
+      start: cycle.last.resets_at - windowSeconds,
+      end: cycle.last.resets_at,
+      used: 100 - cycle.minRemaining,
+      // Last sample well before the reset: usage after it was never seen, so the total is a lower bound.
+      partial: cycle.last.resets_at - cycle.last.created_at > Math.max(windowSeconds * 0.05, 15 * 60),
+    }));
+}
+
+function meterStats(provider, window, samples, now) {
+  const latest = samples[samples.length - 1];
+  const recent = RECENT[window] || RECENT_DEFAULT;
+  const windowSeconds = WINDOW_SECONDS[window];
+  const perUnit = (rate) => `${(rate * recent.unit).toFixed(1)}%/${recent.label}`;
+  const lines = [];
+
+  let head = `${provider} ${window}: ${pct({ remaining: latest.remaining_pct })} left`;
+  const resetsAt = latest.resets_at !== null && latest.resets_at > now ? latest.resets_at : null;
+  if (resetsAt) head += `, resets ${formatTime(resetsAt, now)} (in ${formatDuration(resetsAt - now)})`;
+  if (now - latest.created_at > 30 * 60) head += ` [last sample ${formatDuration(now - latest.created_at)} ago]`;
+  lines.push(head);
+
+  const pace = [];
+  let cycleRate = null;
+  if (resetsAt && windowSeconds) {
+    const elapsed = latest.created_at - (latest.resets_at - windowSeconds);
+    if (elapsed > 0 && elapsed <= windowSeconds) {
+      const used = 100 - latest.remaining_pct;
+      cycleRate = used / elapsed;
+      pace.push(`${perUnit(cycleRate)} this window (${Math.round(used)}% used in ${formatDuration(elapsed)}, ${Math.round((elapsed / windowSeconds) * 100)}% of the window)`);
+    }
+  }
+  const trailing = recentRate(samples, recent.span);
+  if (trailing) pace.push(`${perUnit(trailing.rate)} ${trailing.elapsed >= recent.span * 0.9 ? recent.recentLabel : `last ${formatDuration(trailing.elapsed)}`}`);
+  if (pace.length) lines.push(`  pace: ${pace.join(', ')}`);
+
+  const projections = [['this window\'s pace', cycleRate], [`${recent.recentLabel} pace`, trailing?.rate ?? null]];
+  if (latest.remaining_pct <= 0) {
+    lines.push(resetsAt ? `  used up until the reset in ${formatDuration(resetsAt - now)}` : '  used up');
+    projections.length = 0;
+  }
+  for (const [label, rate] of projections) {
+    if (rate === null) continue;
+    if (rate <= 0) {
+      lines.push(`  at ${label}: no usage`);
+      continue;
+    }
+    const runsOut = latest.created_at + latest.remaining_pct / rate;
+    if (resetsAt && runsOut >= resetsAt) {
+      lines.push(`  at ${label}: ${Math.round(latest.remaining_pct - rate * (resetsAt - latest.created_at))}% left at reset`);
+    } else if (resetsAt) {
+      lines.push(`  at ${label}: runs out ${formatTime(runsOut, now)}, ${formatDuration(resetsAt - runsOut)} before reset`);
+    } else {
+      lines.push(`  at ${label}: runs out ${formatTime(runsOut, now)} (in ${formatDuration(runsOut - now)})`);
+    }
+  }
+
+  if (windowSeconds && windowSeconds >= DAY) {
+    const cycles = pastCycles(samples, windowSeconds, now).slice(-4);
+    if (cycles.length) {
+      const list = cycles.map((cycle) => `${formatDay(cycle.start)}–${formatDay(cycle.end)} ${cycle.partial ? '≥' : ''}${Math.round(cycle.used)}%`);
+      lines.push(`  past windows used: ${list.join(', ')}`);
+    }
+  }
+  return lines;
+}
+
+function showStats(names) {
+  if (!fs.existsSync(HISTORY_DB)) throw new Error(`No history yet at ${HISTORY_DB}. Run without --stats (e.g. from polybar) to start recording.`);
+  const db = openHistory();
+  try {
+    const now = Math.floor(Date.now() / 1000);
+    const order = Object.values(HISTORY_WINDOWS);
+    const meters = db.prepare('SELECT DISTINCT provider, window FROM samples').all()
+      .filter((row) => names.includes(row.provider))
+      .sort((a, b) => names.indexOf(a.provider) - names.indexOf(b.provider) || order.indexOf(a.window) - order.indexOf(b.window));
+    if (!meters.length) throw new Error(`No recorded samples for ${names.join(', ')} in ${HISTORY_DB}.`);
+    const query = db.prepare('SELECT created_at, remaining_pct, resets_at FROM samples WHERE provider = ? AND window = ? ORDER BY created_at');
+    const blocks = meters.map(({ provider, window }) => meterStats(provider, window, query.all(provider, window), now).join('\n'));
+    console.log(blocks.join('\n\n'));
+  } finally {
+    db.close();
+  }
+}
+
 function selectedProviders() {
   const flag = process.argv.indexOf('--provider');
   const raw = flag !== -1 && process.argv[flag + 1] ? process.argv[flag + 1] : PROVIDER;
@@ -750,7 +905,7 @@ async function runCombined(names) {
 
 async function main() {
   if (process.argv.includes('--help') || process.argv.includes('-h')) {
-    console.log('Usage: codex-balance.js [--list-profiles] [--provider <name>[,<name>...]]');
+    console.log('Usage: codex-balance.js [--stats | --list-profiles] [--provider <name>[,<name>...]]');
     console.log('');
     console.log('Providers (--provider or BALANCE_PROVIDER, default all):');
     console.log('  codex     Weekly Codex limit via headless Firefox (ChatGPT login required).');
@@ -764,9 +919,14 @@ async function main() {
     console.log('');
     console.log(`Every run appends the fetched meters to ${HISTORY_DB}`);
     console.log('(BALANCE_HISTORY_DB to move it, BALANCE_HISTORY=0 to turn it off).');
+    console.log('--stats prints burn rates and run-out projections from that history.');
     return;
   }
   const { names, combined } = selectedProviders();
+  if (process.argv.includes('--stats')) {
+    showStats(names);
+    return;
+  }
   if (process.argv.includes('--list-profiles')) {
     if (combined || names[0] !== 'codex') throw new Error('--list-profiles only applies to the codex provider.');
     listProfiles();
