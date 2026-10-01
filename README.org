@@ -129,7 +129,7 @@ Each meter becomes one row in =samples=:
 | =remaining_pct= | remaining percentage, unrounded                                       |
 | =resets_at=     | unix seconds of the next reset, or =NULL= if the provider doesn't say |
 
-OpenCode only shows the reset as "Resets in 3d 8h", so its =resets_at= is accurate to the smallest unit shown. A provider that fails writes nothing for that run. A sample is skipped when the same provider and window already has one from the last 60 seconds, so several polybar bars running the script at once don't produce duplicates.
+OpenCode only shows the reset as "Resets in 3d 8h", so its =resets_at= is rounded down to the smallest unit shown; the stats use the latest reset any sample of a window reported. A provider that fails writes nothing for that run. A sample is skipped when the same provider and window already has one from the last 60 seconds, so several polybar bars running the script at once don't produce duplicates.
 
 Gaps between samples (laptop asleep or off) are just missing rows. Usage from other machines still counts against the limits, so a drop across a gap is real usage whose timing is unknown.
 
@@ -161,11 +161,13 @@ claude week: 78% left, resets Oct 7 18:02 (in 6d)
   past windows used: Sep 19–Sep 26 ≥60%
 #+end_src
 
-- /this window/ is the average since the window started (reset time minus the window length), so it holds across sleep gaps and needs only one sample.
-- /last hour/ (5h windows) or /last 24h/ (weekly and monthly) uses the recorded samples, stopping at the last reset.
+- /this window/ is the average since the window started (reset time minus the window length; monthly windows start on the same day of the previous month), so it holds across sleep gaps and needs only one sample.
+- /last hour/ (5h windows) or /last 24h/ (weekly and monthly) uses the recorded samples, stopping at the last reset. With less history than that, it's labelled with the span it covers (e.g. /last 20m/).
+- Providers report whole percentages, so a projection only appears once there's enough to extrapolate from: 5% of the window for /this window/, a quarter of the span for the recent pace.
 - /past windows used/ lists the last four completed windows. =≥= means the last sample came well before the reset, so later usage wasn't seen.
+- If the latest sample's window has already reset (the laptop was asleep through it), the meter says so instead of showing stale numbers.
 
-Meters without a reset time (OpenCode's rolling 5h) only get the recent pace.
+Meters without a reset time (OpenCode's rolling 5h) get the recent pace but no projection: a rolling window frees old usage continuously, so a straight line through it predicts nothing.
 
 ** Graph
 
@@ -176,11 +178,12 @@ Meters without a reset time (OpenCode's rolling 5h) only get the recent pace.
 ./codex-balance.js --graph --provider claude
 #+end_src
 
-- A sidebar lists every meter with its current level; the chart shows the selected one.
-- The cyan line is the recorded remaining percentage. It breaks where the laptop was asleep instead of bridging the gap.
-- The yellow dotted line projects the current pace to the reset; it turns red when the meter runs out first.
-- The blue dotted line is an even pace through the current window: staying above it means you're under budget.
-- Gray dotted verticals mark resets and the current time. The rightmost quarter of the chart is the future.
+- The sidebar lists every meter with a sparkline of its last 24 hours and its current level. =!= marks a meter that is used up or projected to run out before its reset; =↺= one that has reset since its last sample.
+- The chart shows the selected meter:
+  - cyan: the recorded remaining percentage. Where the laptop was asleep, a gray dotted line joins the readings on either side.
+  - yellow dashes: the current pace projected to the reset, labelled with what's left then. Red, labelled with the time, when the meter runs out first.
+  - blue dots: an even pace through the current window. Staying above it means you're within budget.
+  - magenta dots mark resets, the white line marks now. The right part of the chart is the future, widened to include the next reset when it's close.
 - The =--stats= lines for the meter are shown below the chart.
 
 Keys: =↑ ↓= / =j k= pick a meter, =← →= / =h l= switch between 6h, 24h, 7d and 30d, =r= reload, =q= quit. The history is reloaded every 30 seconds. When the output isn't a terminal, =--graph= prints one static chart per meter instead.
