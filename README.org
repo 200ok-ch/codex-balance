@@ -103,6 +103,7 @@ FIREFOX_PROFILE_DIR=/path/to/profile ./codex-balance.js --provider codex
 ./codex-balance.js --provider codex
 ./codex-balance.js --provider claude,codex
 ./codex-balance.js --stats          # burn rates and projections from the history
+./codex-balance.js --graph          # interactive chart of the history
 BALANCE_PROVIDER=zai ./codex-balance.js
 #+end_src
 
@@ -165,6 +166,24 @@ claude week: 78% left, resets Oct 7 18:02 (in 6d)
 - /past windows used/ lists the last four completed windows. =≥= means the last sample came well before the reset, so later usage wasn't seen.
 
 Meters without a reset time (OpenCode's rolling 5h) only get the recent pace.
+
+** Graph
+
+=--graph= opens an interactive terminal chart of the history (built with [[https://github.com/vadimdemedes/ink][Ink]]):
+
+#+begin_src sh
+./codex-balance.js --graph
+./codex-balance.js --graph --provider claude
+#+end_src
+
+- A sidebar lists every meter with its current level; the chart shows the selected one.
+- The cyan line is the recorded remaining percentage. It breaks where the laptop was asleep instead of bridging the gap.
+- The yellow dotted line projects the current pace to the reset; it turns red when the meter runs out first.
+- The blue dotted line is an even pace through the current window: staying above it means you're under budget.
+- Gray dotted verticals mark resets and the current time. The rightmost quarter of the chart is the future.
+- The =--stats= lines for the meter are shown below the chart.
+
+Keys: =↑ ↓= / =j k= pick a meter, =← →= / =h l= switch between 6h, 24h, 7d and 30d, =r= reload, =q= quit. The history is reloaded every 30 seconds. When the output isn't a terminal, =--graph= prints one static chart per meter instead.
 
 * Polybar Example
 

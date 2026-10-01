@@ -801,80 +801,89 @@ function pastCycles(samples, windowSeconds, now) {
     }));
 }
 
-function meterStats(provider, window, samples, now) {
+// Everything --stats and --graph derive from one meter's samples.
+function analyzeMeter(window, samples, now) {
   const latest = samples[samples.length - 1];
   const recent = RECENT[window] || RECENT_DEFAULT;
-  const windowSeconds = WINDOW_SECONDS[window];
+  const windowSeconds = WINDOW_SECONDS[window] || null;
+  const resetsAt = latest.resets_at !== null && latest.resets_at > now ? latest.resets_at : null;
+  let cycle = null;
+  if (resetsAt && windowSeconds) {
+    const elapsed = latest.created_at - (latest.resets_at - windowSeconds);
+    if (elapsed > 0 && elapsed <= windowSeconds) {
+      const used = 100 - latest.remaining_pct;
+      cycle = { rate: used / elapsed, used, elapsed };
+    }
+  }
+  const cycles = windowSeconds && windowSeconds >= DAY ? pastCycles(samples, windowSeconds, now) : [];
+  return { latest, recent, windowSeconds, resetsAt, cycle, trailing: recentRate(samples, recent.span), cycles };
+}
+
+// Where the meter ends up at a constant rate (percent per second) from the latest sample.
+function project(meter, rate) {
+  const { latest, resetsAt } = meter;
+  if (latest.remaining_pct <= 0 || rate === null || rate === undefined) return null;
+  if (rate <= 0) return { kind: 'idle' };
+  const runsOut = latest.created_at + latest.remaining_pct / rate;
+  if (resetsAt && runsOut >= resetsAt) return { kind: 'lasts', at: resetsAt, remaining: latest.remaining_pct - rate * (resetsAt - latest.created_at) };
+  return { kind: 'runsOut', at: runsOut, remaining: 0 };
+}
+
+function meterStats(provider, window, samples, now) {
+  const meter = analyzeMeter(window, samples, now);
+  const { latest, recent, windowSeconds, resetsAt, cycle, trailing } = meter;
   const perUnit = (rate) => `${(rate * recent.unit).toFixed(1)}%/${recent.label}`;
   const lines = [];
 
   let head = `${provider} ${window}: ${pct({ remaining: latest.remaining_pct })} left`;
-  const resetsAt = latest.resets_at !== null && latest.resets_at > now ? latest.resets_at : null;
   if (resetsAt) head += `, resets ${formatTime(resetsAt, now)} (in ${formatDuration(resetsAt - now)})`;
   if (now - latest.created_at > 30 * 60) head += ` [last sample ${formatDuration(now - latest.created_at)} ago]`;
   lines.push(head);
 
   const pace = [];
-  let cycleRate = null;
-  if (resetsAt && windowSeconds) {
-    const elapsed = latest.created_at - (latest.resets_at - windowSeconds);
-    if (elapsed > 0 && elapsed <= windowSeconds) {
-      const used = 100 - latest.remaining_pct;
-      cycleRate = used / elapsed;
-      pace.push(`${perUnit(cycleRate)} this window (${Math.round(used)}% used in ${formatDuration(elapsed)}, ${Math.round((elapsed / windowSeconds) * 100)}% of the window)`);
-    }
-  }
-  const trailing = recentRate(samples, recent.span);
+  if (cycle) pace.push(`${perUnit(cycle.rate)} this window (${Math.round(cycle.used)}% used in ${formatDuration(cycle.elapsed)}, ${Math.round((cycle.elapsed / windowSeconds) * 100)}% of the window)`);
   if (trailing) pace.push(`${perUnit(trailing.rate)} ${trailing.elapsed >= recent.span * 0.9 ? recent.recentLabel : `last ${formatDuration(trailing.elapsed)}`}`);
   if (pace.length) lines.push(`  pace: ${pace.join(', ')}`);
 
-  const projections = [['this window\'s pace', cycleRate], [`${recent.recentLabel} pace`, trailing?.rate ?? null]];
-  if (latest.remaining_pct <= 0) {
-    lines.push(resetsAt ? `  used up until the reset in ${formatDuration(resetsAt - now)}` : '  used up');
-    projections.length = 0;
-  }
-  for (const [label, rate] of projections) {
-    if (rate === null) continue;
-    if (rate <= 0) {
-      lines.push(`  at ${label}: no usage`);
-      continue;
-    }
-    const runsOut = latest.created_at + latest.remaining_pct / rate;
-    if (resetsAt && runsOut >= resetsAt) {
-      lines.push(`  at ${label}: ${Math.round(latest.remaining_pct - rate * (resetsAt - latest.created_at))}% left at reset`);
-    } else if (resetsAt) {
-      lines.push(`  at ${label}: runs out ${formatTime(runsOut, now)}, ${formatDuration(resetsAt - runsOut)} before reset`);
-    } else {
-      lines.push(`  at ${label}: runs out ${formatTime(runsOut, now)} (in ${formatDuration(runsOut - now)})`);
-    }
+  if (latest.remaining_pct <= 0) lines.push(resetsAt ? `  used up until the reset in ${formatDuration(resetsAt - now)}` : '  used up');
+  for (const [label, rate] of [['this window\'s pace', cycle?.rate], [`${recent.recentLabel} pace`, trailing?.rate]]) {
+    const outcome = project(meter, rate);
+    if (!outcome) continue;
+    if (outcome.kind === 'idle') lines.push(`  at ${label}: no usage`);
+    else if (outcome.kind === 'lasts') lines.push(`  at ${label}: ${Math.round(outcome.remaining)}% left at reset`);
+    else if (resetsAt) lines.push(`  at ${label}: runs out ${formatTime(outcome.at, now)}, ${formatDuration(resetsAt - outcome.at)} before reset`);
+    else lines.push(`  at ${label}: runs out ${formatTime(outcome.at, now)} (in ${formatDuration(outcome.at - now)})`);
   }
 
-  if (windowSeconds && windowSeconds >= DAY) {
-    const cycles = pastCycles(samples, windowSeconds, now).slice(-4);
-    if (cycles.length) {
-      const list = cycles.map((cycle) => `${formatDay(cycle.start)}–${formatDay(cycle.end)} ${cycle.partial ? '≥' : ''}${Math.round(cycle.used)}%`);
-      lines.push(`  past windows used: ${list.join(', ')}`);
-    }
+  const cycles = meter.cycles.slice(-4);
+  if (cycles.length) {
+    const list = cycles.map((past) => `${formatDay(past.start)}–${formatDay(past.end)} ${past.partial ? '≥' : ''}${Math.round(past.used)}%`);
+    lines.push(`  past windows used: ${list.join(', ')}`);
   }
   return lines;
 }
 
-function showStats(names) {
+// Samples per meter for the given providers, in provider order, then 5h/week/month.
+function loadHistory(names) {
   if (!fs.existsSync(HISTORY_DB)) throw new Error(`No history yet at ${HISTORY_DB}. Run without --stats (e.g. from polybar) to start recording.`);
   const db = openHistory();
   try {
-    const now = Math.floor(Date.now() / 1000);
     const order = Object.values(HISTORY_WINDOWS);
     const meters = db.prepare('SELECT DISTINCT provider, window FROM samples').all()
       .filter((row) => names.includes(row.provider))
       .sort((a, b) => names.indexOf(a.provider) - names.indexOf(b.provider) || order.indexOf(a.window) - order.indexOf(b.window));
     if (!meters.length) throw new Error(`No recorded samples for ${names.join(', ')} in ${HISTORY_DB}.`);
     const query = db.prepare('SELECT created_at, remaining_pct, resets_at FROM samples WHERE provider = ? AND window = ? ORDER BY created_at');
-    const blocks = meters.map(({ provider, window }) => meterStats(provider, window, query.all(provider, window), now).join('\n'));
-    console.log(blocks.join('\n\n'));
+    return meters.map(({ provider, window }) => ({ provider, window, samples: query.all(provider, window) }));
   } finally {
     db.close();
   }
+}
+
+function showStats(names) {
+  const now = Math.floor(Date.now() / 1000);
+  const blocks = loadHistory(names).map(({ provider, window, samples }) => meterStats(provider, window, samples, now).join('\n'));
+  console.log(blocks.join('\n\n'));
 }
 
 function selectedProviders() {
@@ -905,7 +914,7 @@ async function runCombined(names) {
 
 async function main() {
   if (process.argv.includes('--help') || process.argv.includes('-h')) {
-    console.log('Usage: codex-balance.js [--stats | --list-profiles] [--provider <name>[,<name>...]]');
+    console.log('Usage: codex-balance.js [--stats | --graph | --list-profiles] [--provider <name>[,<name>...]]');
     console.log('');
     console.log('Providers (--provider or BALANCE_PROVIDER, default all):');
     console.log('  codex     Weekly Codex limit via headless Firefox (ChatGPT login required).');
@@ -919,12 +928,18 @@ async function main() {
     console.log('');
     console.log(`Every run appends the fetched meters to ${HISTORY_DB}`);
     console.log('(BALANCE_HISTORY_DB to move it, BALANCE_HISTORY=0 to turn it off).');
-    console.log('--stats prints burn rates and run-out projections from that history.');
+    console.log('--stats prints burn rates and run-out projections from that history;');
+    console.log('--graph opens an interactive terminal chart of it.');
     return;
   }
   const { names, combined } = selectedProviders();
   if (process.argv.includes('--stats')) {
     showStats(names);
+    return;
+  }
+  if (process.argv.includes('--graph')) {
+    // Ink is ESM-only; keep it out of the polybar path.
+    await (await import('./graph.mjs')).run(names);
     return;
   }
   if (process.argv.includes('--list-profiles')) {
@@ -942,7 +957,11 @@ async function main() {
   recordHistory([{ name: names[0], value }]);
 }
 
-main().catch((error) => {
-  console.error(`codex-balance: ${error.message}`);
-  process.exit(1);
-});
+module.exports = { analyzeMeter, project, meterStats, loadHistory, selectedProviders, formatDuration, formatTime, formatDay, HOUR, DAY };
+
+if (require.main === module) {
+  main().catch((error) => {
+    console.error(`codex-balance: ${error.message}`);
+    process.exit(1);
+  });
+}
