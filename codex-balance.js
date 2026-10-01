@@ -19,6 +19,11 @@ const DEFAULT_PROFILE_INIS = [
 ];
 const PROFILE_INI = process.env.FIREFOX_PROFILES_INI || DEFAULT_PROFILE_INIS.find((candidate) => fs.existsSync(candidate)) || DEFAULT_PROFILE_INIS[0];
 const FIREFOX_EXECUTABLE = process.env.FIREFOX_EXECUTABLE;
+const HISTORY_ENABLED = !['0', 'false', 'no', 'off'].includes(String(process.env.BALANCE_HISTORY || '').toLowerCase());
+const HISTORY_DB = process.env.BALANCE_HISTORY_DB
+  || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'codex-balance', 'history.sqlite');
+// Several polybar bars (one per monitor) each run the script; samples this close together are duplicates.
+const HISTORY_DEDUPE_SECONDS = 60;
 
 const PROFILE_HELP = 'Set FIREFOX_PROFILE_DIR to a Firefox profile that is signed in to ChatGPT.';
 
@@ -270,17 +275,26 @@ function normalizeWhitespace(text) {
   return text.replace(/\s+/g, ' ').trim();
 }
 
+// A meter is { remaining, resetsAt }: remaining percent as an unrounded number
+// (0-100) and the reset time in unix seconds (null when the provider doesn't say).
+// Rounding happens only for display, so recorded history keeps full precision.
+function meter(remaining, resetsAt = null) {
+  const value = parseFloat(remaining);
+  if (!Number.isFinite(value)) return null;
+  const reset = Number(resetsAt);
+  return { remaining: Math.max(0, Math.min(100, value)), resetsAt: Number.isFinite(reset) && reset > 0 ? Math.round(reset) : null };
+}
+
+function pct(m) {
+  return m ? `${Math.round(m.remaining)}%` : 'n/a';
+}
+
 function formatBalance({ weekly }) {
-  return `week: ${weekly || 'n/a'}`;
+  return `week: ${pct(weekly)}`;
 }
 
 function formatZaiBalance({ fiveHour, weekly }) {
-  return `5h: ${fiveHour || 'n/a'} | week: ${weekly || 'n/a'}`;
-}
-function percent(value) {
-  if (typeof value === 'number') return `${Math.round(value)}%`;
-  if (typeof value === 'string') return value.endsWith('%') ? value : `${value}%`;
-  return null;
+  return `5h: ${pct(fiveHour)} | week: ${pct(weekly)}`;
 }
 
 function zaiApiKey() {
@@ -305,12 +319,13 @@ function zaiApiKey() {
 }
 
 function zaiRemaining(entry) {
+  const resetsAt = Number(entry?.nextResetTime) / 1000;
   const raw = Number(entry?.percentage);
-  if (Number.isFinite(raw)) return percent(Math.max(0, Math.min(100, 100 - raw)));
+  if (Number.isFinite(raw)) return meter(100 - raw, resetsAt);
   const remaining = Number(entry?.remaining);
   const total = Number(entry?.usage);
   if (Number.isFinite(remaining) && Number.isFinite(total) && total > 0) {
-    return percent(Math.max(0, Math.min(100, (remaining / total) * 100)));
+    return meter((remaining / total) * 100, resetsAt);
   }
   return null;
 }
@@ -386,7 +401,7 @@ function claudeOauthToken() {
 function claudeRemaining(window) {
   const used = Number(window?.utilization);
   if (window?.utilization === null || window?.utilization === undefined || !Number.isFinite(used)) return null;
-  return percent(Math.max(0, Math.min(100, 100 - used)));
+  return meter(100 - used, Date.parse(window.resets_at) / 1000);
 }
 
 function parseClaudeUsageJson(json) {
@@ -421,9 +436,9 @@ async function fetchClaudeBalance() {
 }
 
 function formatClaudeBalance({ fiveHour, weekly, opus, sonnet }) {
-  const parts = [`5h: ${fiveHour || 'n/a'}`, `week: ${weekly || 'n/a'}`];
-  if (opus) parts.push(`opus week: ${opus}`);
-  if (sonnet) parts.push(`sonnet week: ${sonnet}`);
+  const parts = [`5h: ${pct(fiveHour)}`, `week: ${pct(weekly)}`];
+  if (opus) parts.push(`opus week: ${pct(opus)}`);
+  if (sonnet) parts.push(`sonnet week: ${pct(sonnet)}`);
   return parts.join(' | ');
 }
 
@@ -432,7 +447,8 @@ function parseUsageJson(json) {
   const remainingForDuration = (seconds) => {
     const window = windows.find((candidate) => candidate.limit_window_seconds === seconds);
     if (typeof window?.used_percent !== 'number') return null;
-    return percent(Math.max(0, 100 - window.used_percent));
+    const resetsAt = window.reset_at ?? (Number.isFinite(window.reset_after_seconds) ? Date.now() / 1000 + window.reset_after_seconds : null);
+    return meter(100 - window.used_percent, resetsAt);
   };
   const weekly = remainingForDuration(7 * 24 * 60 * 60);
 
@@ -441,7 +457,7 @@ function parseUsageJson(json) {
   const text = JSON.stringify(json);
   const weeklyFallback = text.match(/"(?:remaining_percentage|remaining_percent|percent_remaining|percentage_remaining|remaining)"\s*:\s*(\d+(?:\.\d+)?).*?"(?:weekly|week)/i)?.[1];
 
-  if (weeklyFallback) return { weekly: percent(Number(weeklyFallback)) };
+  if (weeklyFallback) return { weekly: meter(weeklyFallback) };
 
   const candidates = [];
   function visit(value, pathParts = []) {
@@ -460,8 +476,9 @@ function parseUsageJson(json) {
 
   const weeklyCandidate = candidates.find((candidate) => /week/i.test(candidate.path) && /remain|percent|percentage/i.test(candidate.path));
 
-  if (weeklyCandidate) {
-    return { weekly: percent(weeklyCandidate.value) };
+  const weeklyCandidateMeter = weeklyCandidate && meter(weeklyCandidate.value);
+  if (weeklyCandidateMeter) {
+    return { weekly: weeklyCandidateMeter };
   }
 
   throw new Error(`Could not parse usage response: ${text.slice(0, 500)}`);
@@ -504,7 +521,7 @@ async function extractBalances(page) {
   }
 
   const bodyText = normalizeWhitespace(await page.locator('body').innerText({ timeout: TIMEOUT_MS }));
-  const weekly = bodyText.match(/Weekly\s+usage\s+limit\s+(\d+%)\s+remaining/i)?.[1];
+  const weekly = meter(bodyText.match(/Weekly\s+usage\s+limit\s+(\d+(?:\.\d+)?)%\s+remaining/i)?.[1]);
 
   if (!weekly) {
     throw new Error('Could not parse balance values from the Codex analytics page.');
@@ -546,14 +563,24 @@ async function fetchCodexBalance() {
   }
 }
 
+// "Resets in 3d 8h" -> seconds. Only as precise as the page, so the derived
+// resetsAt can drift by up to the smallest unit shown between polls.
+function relativeSeconds(text) {
+  const units = { d: 86400, h: 3600, m: 60, s: 1 };
+  let total = 0;
+  for (const [, amount, unit] of String(text).matchAll(/(\d+)\s*([dhms])/gi)) total += Number(amount) * units[unit.toLowerCase()];
+  return total || null;
+}
+
 // The Go page has rendered both "Rolling usage 2%" (used) and
 // "Rolling usage 100% left" (remaining); honour the suffix when present.
 function opencodeRemaining(bodyText, label) {
-  const match = bodyText.match(new RegExp(`${label} usage (\\d+(?:\\.\\d+)?)%(\\s+(?:left|remaining))?`, 'i'));
+  const match = bodyText.match(new RegExp(`${label} usage (\\d+(?:\\.\\d+)?)%(\\s+(?:left|remaining))?(?:\\s+Resets in ((?:\\d+\\s*[dhms]\\s*)+))?`, 'i'));
   if (!match) return null;
   const value = Number(match[1]);
   const remaining = match[2] ? value : 100 - value;
-  return percent(Math.max(0, Math.min(100, remaining)));
+  const resetIn = relativeSeconds(match[3]);
+  return meter(remaining, resetIn && Date.now() / 1000 + resetIn);
 }
 
 async function fetchOpencodeBalance() {
@@ -608,27 +635,92 @@ const PROVIDERS = {
     label: 'C',
     fetch: fetchCodexBalance,
     format: formatBalance,
-    compact: ({ weekly }) => weekly || 'n/a',
+    compact: ({ weekly }) => pct(weekly),
   },
   zai: {
     label: 'Z',
     fetch: fetchZaiBalance,
     format: formatZaiBalance,
-    compact: ({ fiveHour, weekly }) => `${fiveHour || 'n/a'}/${weekly || 'n/a'}`,
+    compact: ({ fiveHour, weekly }) => `${pct(fiveHour)}/${pct(weekly)}`,
   },
   opencode: {
     label: 'O',
     fetch: fetchOpencodeBalance,
-    format: ({ fiveHour, weekly, monthly }) => `5h: ${fiveHour || 'n/a'} | week: ${weekly || 'n/a'} | month: ${monthly || 'n/a'}`,
-    compact: ({ fiveHour, weekly, monthly }) => `${fiveHour || 'n/a'}/${weekly || 'n/a'}/${monthly || 'n/a'}`,
+    format: ({ fiveHour, weekly, monthly }) => `5h: ${pct(fiveHour)} | week: ${pct(weekly)} | month: ${pct(monthly)}`,
+    compact: ({ fiveHour, weekly, monthly }) => `${pct(fiveHour)}/${pct(weekly)}/${pct(monthly)}`,
   },
   claude: {
     label: 'CC',
     fetch: fetchClaudeBalance,
     format: formatClaudeBalance,
-    compact: ({ fiveHour, weekly }) => `${fiveHour || 'n/a'}/${weekly || 'n/a'}`,
+    compact: ({ fiveHour, weekly }) => `${pct(fiveHour)}/${pct(weekly)}`,
   },
 };
+
+// Meter keys as returned by the fetchers -> window names stored in history.
+const HISTORY_WINDOWS = { fiveHour: '5h', weekly: 'week', monthly: 'month', opus: 'opus_week', sonnet: 'sonnet_week' };
+
+function openHistory() {
+  // node:sqlite is still flagged experimental on Node 22 and warns on every load; keep stderr quiet.
+  const emitWarning = process.emitWarning;
+  process.emitWarning = function (warning, ...rest) {
+    if (String(warning?.message ?? warning).includes('SQLite')) return;
+    return emitWarning.call(this, warning, ...rest);
+  };
+  let DatabaseSync;
+  try {
+    ({ DatabaseSync } = require('node:sqlite'));
+  } catch {
+    throw new Error(`needs Node.js 22.13 or newer (running ${process.version}); set BALANCE_HISTORY=0 to silence this.`);
+  } finally {
+    process.emitWarning = emitWarning;
+  }
+  fs.mkdirSync(path.dirname(HISTORY_DB), { recursive: true });
+  const db = new DatabaseSync(HISTORY_DB);
+  db.exec(`
+    PRAGMA busy_timeout = 5000;
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE IF NOT EXISTS samples (
+      created_at    INTEGER NOT NULL, -- unix seconds, shared by every row of one run
+      provider      TEXT    NOT NULL,
+      window        TEXT    NOT NULL,
+      remaining_pct REAL    NOT NULL,
+      resets_at     INTEGER           -- unix seconds; null when the provider doesn't say
+    );
+    CREATE INDEX IF NOT EXISTS samples_lookup ON samples (provider, window, created_at);
+  `);
+  return db;
+}
+
+// Append one row per meter of every provider that answered. Never affects the printed balance.
+function recordHistory(results) {
+  if (!HISTORY_ENABLED) return;
+  const rows = results.flatMap(({ name, value }) => Object.entries(value || {})
+    .filter(([key, m]) => m && HISTORY_WINDOWS[key])
+    .map(([key, m]) => ({ provider: name, window: HISTORY_WINDOWS[key], ...m })));
+  if (!rows.length) return;
+  let db;
+  try {
+    db = openHistory();
+    const createdAt = Math.floor(Date.now() / 1000);
+    const insert = db.prepare(`
+      INSERT INTO samples (created_at, provider, window, remaining_pct, resets_at)
+      SELECT ?, ?, ?, ?, ?
+      WHERE NOT EXISTS (SELECT 1 FROM samples WHERE provider = ? AND window = ? AND created_at > ?)
+    `);
+    db.exec('BEGIN IMMEDIATE');
+    for (const row of rows) {
+      insert.run(createdAt, row.provider, row.window, row.remaining, row.resetsAt,
+        row.provider, row.window, createdAt - HISTORY_DEDUPE_SECONDS);
+    }
+    db.exec('COMMIT');
+  } catch (error) {
+    // close() below rolls back an unfinished transaction.
+    console.error(`codex-balance: history: ${error.message}`);
+  } finally {
+    db?.close();
+  }
+}
 
 function selectedProviders() {
   const flag = process.argv.indexOf('--provider');
@@ -652,6 +744,7 @@ async function runCombined(names) {
     return `${provider.label} ?`;
   });
   console.log(parts.join(' | '));
+  recordHistory(results.flatMap((result, index) => (result.status === 'fulfilled' ? [{ name: names[index], value: result.value }] : [])));
   if (results.every((result) => result.status === 'rejected')) process.exitCode = 1;
 }
 
@@ -668,6 +761,9 @@ async function main() {
     console.log('');
     console.log('Several providers (e.g. --provider claude,zai) print a compact line in the given order:');
     console.log('  C <week> | Z <5h>/<week> | O <5h>/<week>/<month> | CC <5h>/<week>');
+    console.log('');
+    console.log(`Every run appends the fetched meters to ${HISTORY_DB}`);
+    console.log('(BALANCE_HISTORY_DB to move it, BALANCE_HISTORY=0 to turn it off).');
     return;
   }
   const { names, combined } = selectedProviders();
@@ -681,7 +777,9 @@ async function main() {
     return;
   }
   const provider = PROVIDERS[names[0]];
-  console.log(provider.format(await provider.fetch()));
+  const value = await provider.fetch();
+  console.log(provider.format(value));
+  recordHistory([{ name: names[0], value }]);
 }
 
 main().catch((error) => {

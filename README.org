@@ -34,7 +34,7 @@ week: 97%
 
 * Requirements
 
-- Node.js 20 or newer
+- Node.js 22.13 or newer (for the built-in =node:sqlite= used by the usage history)
 - Firefox with an active ChatGPT login (codex provider)
 - Firefox with an active opencode.ai login (opencode provider)
 - =sqlite3=, used to read Firefox's cookie database (codex, opencode providers)
@@ -109,6 +109,38 @@ The codex and opencode providers perform a live headless Firefox refresh each in
 
 If the account does not currently have a weekly usage window, its value is printed as =n/a=.
 
+* Usage History
+
+Every run appends what it fetched to a SQLite database, so a status bar polling all day builds up a record of how fast each limit is used:
+
+#+begin_src text
+~/.local/state/codex-balance/history.sqlite   ($XDG_STATE_HOME/codex-balance/history.sqlite)
+#+end_src
+
+Each meter becomes one row in =samples=:
+
+| column          | meaning                                                               |
+|-----------------+-----------------------------------------------------------------------|
+| =created_at=    | unix seconds; the same for every row written by one run               |
+| =provider=      | =codex=, =zai=, =opencode= or =claude=                                |
+| =window=        | =5h=, =week=, =month=, =opus_week= or =sonnet_week=                   |
+| =remaining_pct= | remaining percentage, unrounded                                       |
+| =resets_at=     | unix seconds of the next reset, or =NULL= if the provider doesn't say |
+
+OpenCode only shows the reset as "Resets in 3d 8h", so its =resets_at= is accurate to the smallest unit shown. A provider that fails writes nothing for that run. A sample is skipped when the same provider and window already has one from the last 60 seconds, so several polybar bars running the script at once don't produce duplicates.
+
+Gaps between samples (laptop asleep or off) are just missing rows. Usage from other machines still counts against the limits, so a drop across a gap is real usage whose timing is unknown.
+
+#+begin_src sh
+BALANCE_HISTORY_DB=/path/to/history.sqlite ./codex-balance.js   # use another database
+BALANCE_HISTORY=0 ./codex-balance.js                            # don't record
+sqlite3 -header -column ~/.local/state/codex-balance/history.sqlite \
+  "SELECT datetime(created_at, 'unixepoch', 'localtime') AS at, provider, window, remaining_pct
+   FROM samples ORDER BY created_at DESC LIMIT 20"
+#+end_src
+
+Recording never changes the printed balance; if it fails, the reason goes to stderr.
+
 * Polybar Example
 
 #+begin_src conf
@@ -117,6 +149,8 @@ type = custom/script
 exec = /path/to/codex-balance/codex-balance.js
 interval = 600
 #+end_src
+
+Polybar resolves =node= from its own =PATH=, which usually doesn't include nvm. If the =node= it finds is older than 22.13, point =exec= at a newer one, e.g. =exec = ~/.nvm/versions/node/v24.21.0/bin/node /path/to/codex-balance/codex-balance.js=.
 
 Then add =codex-balance= to your Polybar module list. The default =all= provider prints a compact one-liner (=C= codex week, =Z= z.ai 5h/week, =O= OpenCode Go 5h/week/month, =CC= Claude Code 5h/week) that fits a single polybar module. Use =exec = /path/to/codex-balance/codex-balance.js --provider claude,codex= to show only the providers you use.
 
