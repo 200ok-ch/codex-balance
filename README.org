@@ -173,6 +173,8 @@ Meters without a reset time (OpenCode's rolling 5h) get the recent pace but no p
 
 =--graph= opens an interactive terminal chart of the history (built with [[https://github.com/vadimdemedes/ink][Ink]]):
 
+[[file:doc/graph.png]]
+
 #+begin_src sh
 ./codex-balance.js --graph
 ./codex-balance.js --graph --provider claude
