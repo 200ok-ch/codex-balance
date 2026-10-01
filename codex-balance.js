@@ -725,7 +725,8 @@ function recordHistory(results) {
 // --stats: burn rates and projections from the recorded history (no fetching).
 const HOUR = 3600;
 const DAY = 24 * HOUR;
-// Fixed windows: usage starts at 0 at (resets_at - length), which gives a pace even across sleep gaps.
+// Fixed windows: usage starts at 0 at the window start, which gives a pace even across sleep gaps.
+// Months are calendar months (see windowStart), so 30 days is only their nominal length.
 const WINDOW_SECONDS = { '5h': 5 * HOUR, week: 7 * DAY, opus_week: 7 * DAY, sonnet_week: 7 * DAY, month: 30 * DAY };
 // Short windows read in %/h over the last hour; long ones in %/day over the last day.
 const RECENT = { '5h': { span: HOUR, unit: HOUR, label: 'h', recentLabel: 'last hour' } };
@@ -755,6 +756,14 @@ function formatDay(unix) {
   return new Date(unix * 1000).toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
 }
 
+// Billing months run from the same day of the previous month, not a fixed 30 days.
+function windowStart(window, resetsAt) {
+  if (window !== 'month') return resetsAt - WINDOW_SECONDS[window];
+  const start = new Date(resetsAt * 1000);
+  start.setMonth(start.getMonth() - 1);
+  return start.getTime() / 1000;
+}
+
 function sameCycle(a, b) {
   if (a.resets_at === null || b.resets_at === null) return a.resets_at === b.resets_at;
   return Math.abs(a.resets_at - b.resets_at) <= RESET_TOLERANCE;
@@ -777,27 +786,36 @@ function recentRate(samples, span) {
   return { rate: (oldest.remaining_pct - latest.remaining_pct) / elapsed, elapsed };
 }
 
-// Completed cycles, oldest first, with how much of the limit they used.
-function pastCycles(samples, windowSeconds, now) {
+// Consecutive samples grouped by window, oldest first. A window's reset time is the
+// latest one any of its samples reported: OpenCode's "Resets in 3d 7h" drops the
+// minutes, so each sample's resets_at is a lower bound and the largest is the closest.
+function groupCycles(samples) {
   const cycles = [];
   for (const sample of samples) {
     if (sample.resets_at === null) continue;
     const current = cycles[cycles.length - 1];
     if (current && sameCycle(current.last, sample)) {
       current.last = sample;
+      current.resetsAt = Math.max(current.resetsAt, sample.resets_at);
       current.minRemaining = Math.min(current.minRemaining, sample.remaining_pct);
     } else {
-      cycles.push({ last: sample, minRemaining: sample.remaining_pct });
+      cycles.push({ last: sample, resetsAt: sample.resets_at, minRemaining: sample.remaining_pct });
     }
   }
+  return cycles;
+}
+
+// Completed cycles, oldest first, with how much of the limit they used.
+function pastCycles(cycles, window, now) {
+  const windowSeconds = WINDOW_SECONDS[window];
   return cycles
-    .filter((cycle) => cycle.last.resets_at <= now)
+    .filter((cycle) => cycle.resetsAt <= now)
     .map((cycle) => ({
-      start: cycle.last.resets_at - windowSeconds,
-      end: cycle.last.resets_at,
+      start: windowStart(window, cycle.resetsAt),
+      end: cycle.resetsAt,
       used: 100 - cycle.minRemaining,
       // Last sample well before the reset: usage after it was never seen, so the total is a lower bound.
-      partial: cycle.last.resets_at - cycle.last.created_at > Math.max(windowSeconds * 0.05, 15 * 60),
+      partial: cycle.resetsAt - cycle.last.created_at > Math.max(windowSeconds * 0.05, 15 * 60),
     }));
 }
 
@@ -806,53 +824,84 @@ function analyzeMeter(window, samples, now) {
   const latest = samples[samples.length - 1];
   const recent = RECENT[window] || RECENT_DEFAULT;
   const windowSeconds = WINDOW_SECONDS[window] || null;
-  const resetsAt = latest.resets_at !== null && latest.resets_at > now ? latest.resets_at : null;
+  const cycles = groupCycles(samples);
+  const current = latest.resets_at !== null ? cycles[cycles.length - 1] : null;
+  // The window of the latest sample already reset (laptop asleep through it): its numbers are history.
+  const resetSince = current && current.resetsAt <= now ? current.resetsAt : null;
+  const resetsAt = current && !resetSince ? current.resetsAt : null;
   let cycle = null;
   if (resetsAt && windowSeconds) {
-    const elapsed = latest.created_at - (latest.resets_at - windowSeconds);
-    if (elapsed > 0 && elapsed <= windowSeconds) {
+    const start = windowStart(window, resetsAt);
+    const elapsed = latest.created_at - start;
+    const length = resetsAt - start;
+    if (elapsed > 0 && elapsed <= length) {
       const used = 100 - latest.remaining_pct;
-      cycle = { rate: used / elapsed, used, elapsed };
+      // Whole-percent readings make the first minutes of a window wildly extrapolate; wait for 5% of it.
+      cycle = { rate: used / elapsed, used, elapsed, length, start, projectable: elapsed >= length * 0.05 };
     }
   }
-  const cycles = windowSeconds && windowSeconds >= DAY ? pastCycles(samples, windowSeconds, now) : [];
-  return { latest, recent, windowSeconds, resetsAt, cycle, trailing: recentRate(samples, recent.span), cycles };
+  let trailing = resetSince ? null : recentRate(samples, recent.span);
+  if (trailing) {
+    const label = trailing.elapsed >= recent.span * 0.9 ? recent.recentLabel : `last ${formatDuration(trailing.elapsed)}`;
+    trailing = { ...trailing, label, projectable: trailing.elapsed >= recent.span / 4 };
+  }
+  const past = windowSeconds && windowSeconds >= DAY ? pastCycles(cycles, window, now) : [];
+  return {
+    latest, recent, windowSeconds, resetsAt, resetSince, cycle, trailing, cycles: past,
+    windowStart: resetsAt && windowSeconds ? windowStart(window, resetsAt) : null,
+    // One reset per window seen, for chart markers (not one per drifting OpenCode estimate).
+    resets: cycles.map((c) => c.resetsAt),
+  };
+}
+
+// The rate projections use: this window's average, else the recent one.
+function projectionRate(meter) {
+  if (meter.cycle?.projectable) return meter.cycle.rate;
+  if (meter.trailing?.projectable) return meter.trailing.rate;
+  return null;
 }
 
 // Where the meter ends up at a constant rate (percent per second) from the latest sample.
+// Only for windows with a known reset: a rolling window (OpenCode's 5h) frees old usage
+// continuously, so a straight line through its readings predicts nothing.
 function project(meter, rate) {
   const { latest, resetsAt } = meter;
-  if (latest.remaining_pct <= 0 || rate === null || rate === undefined) return null;
+  if (!resetsAt || latest.remaining_pct <= 0 || rate === null || rate === undefined) return null;
   if (rate <= 0) return { kind: 'idle' };
   const runsOut = latest.created_at + latest.remaining_pct / rate;
-  if (resetsAt && runsOut >= resetsAt) return { kind: 'lasts', at: resetsAt, remaining: latest.remaining_pct - rate * (resetsAt - latest.created_at) };
+  if (runsOut >= resetsAt) return { kind: 'lasts', at: resetsAt, remaining: latest.remaining_pct - rate * (resetsAt - latest.created_at) };
   return { kind: 'runsOut', at: runsOut, remaining: 0 };
 }
 
 function meterStats(provider, window, samples, now) {
   const meter = analyzeMeter(window, samples, now);
-  const { latest, recent, windowSeconds, resetsAt, cycle, trailing } = meter;
+  const { latest, recent, resetsAt, cycle, trailing } = meter;
   const perUnit = (rate) => `${(rate * recent.unit).toFixed(1)}%/${recent.label}`;
   const lines = [];
 
-  let head = `${provider} ${window}: ${pct({ remaining: latest.remaining_pct })} left`;
-  if (resetsAt) head += `, resets ${formatTime(resetsAt, now)} (in ${formatDuration(resetsAt - now)})`;
-  if (now - latest.created_at > 30 * 60) head += ` [last sample ${formatDuration(now - latest.created_at)} ago]`;
-  lines.push(head);
+  if (meter.resetSince) {
+    lines.push(`${provider} ${window}: reset ${formatTime(meter.resetSince, now)}, no sample since (was ${pct({ remaining: latest.remaining_pct })} left)`);
+  } else {
+    let head = `${provider} ${window}: ${pct({ remaining: latest.remaining_pct })} left`;
+    if (resetsAt) head += `, resets ${formatTime(resetsAt, now)} (in ${formatDuration(resetsAt - now)})`;
+    if (now - latest.created_at > 30 * 60) head += ` [last sample ${formatDuration(now - latest.created_at)} ago]`;
+    lines.push(head);
+  }
 
   const pace = [];
-  if (cycle) pace.push(`${perUnit(cycle.rate)} this window (${Math.round(cycle.used)}% used in ${formatDuration(cycle.elapsed)}, ${Math.round((cycle.elapsed / windowSeconds) * 100)}% of the window)`);
-  if (trailing) pace.push(`${perUnit(trailing.rate)} ${trailing.elapsed >= recent.span * 0.9 ? recent.recentLabel : `last ${formatDuration(trailing.elapsed)}`}`);
+  if (cycle) pace.push(`${perUnit(cycle.rate)} this window (${Math.round(cycle.used)}% used in ${formatDuration(cycle.elapsed)}, ${Math.round((cycle.elapsed / cycle.length) * 100)}% of the window)`);
+  if (trailing) pace.push(`${perUnit(trailing.rate)} ${trailing.label}`);
   if (pace.length) lines.push(`  pace: ${pace.join(', ')}`);
 
-  if (latest.remaining_pct <= 0) lines.push(resetsAt ? `  used up until the reset in ${formatDuration(resetsAt - now)}` : '  used up');
-  for (const [label, rate] of [['this window\'s pace', cycle?.rate], [`${recent.recentLabel} pace`, trailing?.rate]]) {
-    const outcome = project(meter, rate);
+  if (!meter.resetSince && latest.remaining_pct <= 0) lines.push(resetsAt ? `  used up until the reset in ${formatDuration(resetsAt - now)}` : '  used up');
+  const projections = [['this window\'s pace', cycle?.projectable && cycle.rate], [`${trailing?.label} pace`, trailing?.projectable && trailing.rate]];
+  for (const [label, rate] of projections) {
+    const outcome = project(meter, rate === false ? null : rate);
     if (!outcome) continue;
     if (outcome.kind === 'idle') lines.push(`  at ${label}: no usage`);
     else if (outcome.kind === 'lasts') lines.push(`  at ${label}: ${Math.round(outcome.remaining)}% left at reset`);
-    else if (resetsAt) lines.push(`  at ${label}: runs out ${formatTime(outcome.at, now)}, ${formatDuration(resetsAt - outcome.at)} before reset`);
-    else lines.push(`  at ${label}: runs out ${formatTime(outcome.at, now)} (in ${formatDuration(outcome.at - now)})`);
+    else if (outcome.at <= now) lines.push(`  at ${label}: would have run out by ${formatTime(outcome.at, now)}`);
+    else lines.push(`  at ${label}: runs out ${formatTime(outcome.at, now)}, ${formatDuration(resetsAt - outcome.at)} before reset`);
   }
 
   const cycles = meter.cycles.slice(-4);
@@ -957,7 +1006,7 @@ async function main() {
   recordHistory([{ name: names[0], value }]);
 }
 
-module.exports = { analyzeMeter, project, meterStats, loadHistory, selectedProviders, formatDuration, formatTime, formatDay, HOUR, DAY };
+module.exports = { analyzeMeter, project, projectionRate, meterStats, loadHistory, selectedProviders, formatDuration, formatTime, formatDay, HOUR, DAY };
 
 if (require.main === module) {
   main().catch((error) => {
