@@ -1,14 +1,14 @@
 {
-  "name": "codex-balance",
+  "name": "llm-runway",
   "version": "0.1.0",
-  "description": "Print remaining usage limits (Codex, Z.ai) for status bars and scripts.",
+  "description": "Remaining AI coding plan limits (Codex, Claude Code, Z.ai, OpenCode) for status bars, with usage history, burn rates and terminal charts.",
   "license": "MIT",
   "type": "commonjs",
   "bin": {
-    "codex-balance": "./codex-balance.js"
+    "llm-runway": "./llm-runway.js"
   },
   "scripts": {
-    "check": "node --check codex-balance.js && node --check graph.mjs"
+    "check": "node --check llm-runway.js && node --check graph.mjs"
   },
   "engines": {
     "node": ">=22.13"

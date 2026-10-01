@@ -1,8 +1,8 @@
-#+TITLE: codex-balance
+#+TITLE: llm-runway
 
-Print remaining usage limits for status bars, shell scripts, and small desktop widgets.
+See how much of your AI coding plans' usage limits is left, and how long it will last: remaining quotas for status bars and scripts, plus a recorded history with burn rates, run-out projections and terminal charts.
 
-Supported providers (select with =--provider= or =BALANCE_PROVIDER=, default =all=):
+Supported providers (select with =--provider= or =LLM_RUNWAY_PROVIDER=, default =all=):
 
 - =all= — every provider on one compact line for polybar: =C <codex week> | Z <z.ai 5h>/<z.ai week> | O <go 5h>/<go week>/<go month> | CC <claude 5h>/<claude week>=.
 - =codex= — remaining Codex weekly usage limit (headless Firefox + ChatGPT login).
@@ -13,12 +13,12 @@ Supported providers (select with =--provider= or =BALANCE_PROVIDER=, default =al
 Pass a comma-separated list to pick which providers appear on the compact line, and in which order:
 
 #+begin_src sh
-./codex-balance.js --provider claude,zai     # CC 97%/100% | Z 71%/87%
+./llm-runway.js --provider claude,zai     # CC 97%/100% | Z 71%/87%
 #+end_src
 
 On the compact line, a provider that fails prints =?= (the reason goes to stderr) so the others still show.
 
-This is for people who want their current balance visible at a glance instead of manually refreshing analytics pages throughout the day.
+This is for people who want their remaining limits visible at a glance instead of manually refreshing analytics pages throughout the day.
 #+begin_src text
 C 97% | Z 99%/39% | O 98%/99%/98% | CC 97%/100%
 #+end_src
@@ -57,15 +57,13 @@ Useful environment variables:
 FIREFOX_PROFILE_DIR=/path/to/profile
 FIREFOX_PROFILES_INI=/path/to/profiles.ini
 FIREFOX_EXECUTABLE=/path/to/playwright/firefox
-BALANCE_PROVIDER=zai
+LLM_RUNWAY_PROVIDER=zai
 ZAI_API_KEY=your-zai-api-key
 OPENCODE_ORG=org_0123456789ABCDEFGHIJKLMNPQ
 CLAUDE_CONFIG_DIR=~/.claude
 CLAUDE_CODE_OAUTH_TOKEN=your-claude-oauth-token
-BALANCE_TIMEOUT_MS=8000 ./codex-balance.js
+LLM_RUNWAY_TIMEOUT_MS=8000 ./llm-runway.js
 #+end_src
-
-=BALANCE_TIMEOUT_MS= takes precedence; the old =CODEX_BALANCE_TIMEOUT_MS= still works.
 
 The codex provider scrapes the Codex analytics page in a headless Firefox using your ChatGPT cookies — no OAuth tokens, no direct API calls, just what your own browser session can already see.
 
@@ -76,16 +74,16 @@ Z.ai keys are read from =ZAI_API_KEY=, then =GLM_API_KEY=, then your omp/opencod
 The claude provider reads the OAuth access token Claude Code stores in =$CLAUDE_CONFIG_DIR/.credentials.json= (default =~/.claude=), or =CLAUDE_CODE_OAUTH_TOKEN= if set, and asks =https://api.anthropic.com/api/oauth/usage= for the same numbers =/usage= shows. The token lasts a few hours and Claude Code refreshes it whenever you use it; this script never refreshes it itself, because that would rotate the refresh token and log Claude Code out. If you haven't used =claude= in a while, run it once. On macOS Claude Code keeps the token in the Keychain, so set =CLAUDE_CODE_OAUTH_TOKEN= there.
 
 #+begin_src sh
-./codex-balance.js --provider claude
-./codex-balance.js --provider opencode
-./codex-balance.js --provider zai
-./codex-balance.js --help
+./llm-runway.js --provider claude
+./llm-runway.js --provider opencode
+./llm-runway.js --provider zai
+./llm-runway.js --help
 #+end_src
 
 To inspect Firefox profiles and see which ones have ChatGPT/OpenAI cookies:
 
 #+begin_src sh
-./codex-balance.js --list-profiles --provider codex
+./llm-runway.js --list-profiles --provider codex
 #+end_src
 
 The profile list checks both the regular Firefox location and the Firefox Snap location when present.
@@ -93,18 +91,18 @@ The profile list checks both the regular Firefox location and the Firefox Snap l
 Use the reported profile path with =FIREFOX_PROFILE_DIR= if the automatically selected profile is not the one signed in to ChatGPT.
 
 #+begin_src sh
-FIREFOX_PROFILE_DIR=/path/to/profile ./codex-balance.js --provider codex
+FIREFOX_PROFILE_DIR=/path/to/profile ./llm-runway.js --provider codex
 #+end_src
 
 * Usage
 
 #+begin_src sh
-./codex-balance.js                  # all providers, one line
-./codex-balance.js --provider codex
-./codex-balance.js --provider claude,codex
-./codex-balance.js --stats          # burn rates and projections from the history
-./codex-balance.js --graph          # interactive chart of the history
-BALANCE_PROVIDER=zai ./codex-balance.js
+./llm-runway.js                  # all providers, one line
+./llm-runway.js --provider codex
+./llm-runway.js --provider claude,codex
+./llm-runway.js --stats          # burn rates and projections from the history
+./llm-runway.js --graph          # interactive chart of the history
+LLM_RUNWAY_PROVIDER=zai ./llm-runway.js
 #+end_src
 
 The codex and opencode providers perform a live headless Firefox refresh each invocation. Poll every 10 minutes from your status bar or scheduler to keep runtime and network usage low.
@@ -116,7 +114,7 @@ If the account does not currently have a weekly usage window, its value is print
 Every run appends what it fetched to a SQLite database, so a status bar polling all day builds up a record of how fast each limit is used:
 
 #+begin_src text
-~/.local/state/codex-balance/history.sqlite   ($XDG_STATE_HOME/codex-balance/history.sqlite)
+~/.local/state/llm-runway/history.sqlite   ($XDG_STATE_HOME/llm-runway/history.sqlite)
 #+end_src
 
 Each meter becomes one row in =samples=:
@@ -134,21 +132,21 @@ OpenCode only shows the reset as "Resets in 3d 8h", so its =resets_at= is rounde
 Gaps between samples (laptop asleep or off) are just missing rows. Usage from other machines still counts against the limits, so a drop across a gap is real usage whose timing is unknown.
 
 #+begin_src sh
-BALANCE_HISTORY_DB=/path/to/history.sqlite ./codex-balance.js   # use another database
-BALANCE_HISTORY=0 ./codex-balance.js                            # don't record
-sqlite3 -header -column ~/.local/state/codex-balance/history.sqlite \
+LLM_RUNWAY_HISTORY_DB=/path/to/history.sqlite ./llm-runway.js   # use another database
+LLM_RUNWAY_HISTORY=0 ./llm-runway.js                            # don't record
+sqlite3 -header -column ~/.local/state/llm-runway/history.sqlite \
   "SELECT datetime(created_at, 'unixepoch', 'localtime') AS at, provider, window, remaining_pct
    FROM samples ORDER BY created_at DESC LIMIT 20"
 #+end_src
 
-Recording never changes the printed balance; if it fails, the reason goes to stderr.
+Recording never changes the printed output; if it fails, the reason goes to stderr.
 
 ** Stats
 
 =--stats= reads the history (it doesn't fetch anything) and prints, per meter, how fast it is being used and whether it will last until the reset:
 
 #+begin_src text
-$ ./codex-balance.js --stats --provider claude
+$ ./llm-runway.js --stats --provider claude
 claude 5h: 30% left, resets 21:02 (in 3h)
   pace: 35.0%/h this window (70% used in 2h, 40% of the window), 30.0%/h last hour
   at this window's pace: runs out 18:53, 2h 9m before reset
@@ -176,8 +174,8 @@ Meters without a reset time (OpenCode's rolling 5h) get the recent pace but no p
 [[file:doc/graph.png]]
 
 #+begin_src sh
-./codex-balance.js --graph
-./codex-balance.js --graph --provider claude
+./llm-runway.js --graph
+./llm-runway.js --graph --provider claude
 #+end_src
 
 - The sidebar lists every meter with a sparkline of its last 24 hours and its current level. =!= marks a meter that is used up or projected to run out before its reset; =↺= one that has reset since its last sample.
@@ -193,15 +191,15 @@ Keys: =↑ ↓= / =j k= pick a meter, =← →= / =h l= switch between 6h, 24h, 
 * Polybar Example
 
 #+begin_src conf
-[module/codex-balance]
+[module/llm-runway]
 type = custom/script
-exec = /path/to/codex-balance/codex-balance.js
+exec = /path/to/llm-runway/llm-runway.js
 interval = 600
 #+end_src
 
-Polybar resolves =node= from its own =PATH=, which usually doesn't include nvm. If the =node= it finds is older than 22.13, point =exec= at a newer one, e.g. =exec = ~/.nvm/versions/node/v24.21.0/bin/node /path/to/codex-balance/codex-balance.js=.
+Polybar resolves =node= from its own =PATH=, which usually doesn't include nvm. If the =node= it finds is older than 22.13, point =exec= at a newer one, e.g. =exec = ~/.nvm/versions/node/v24.21.0/bin/node /path/to/llm-runway/llm-runway.js=.
 
-Then add =codex-balance= to your Polybar module list. The default =all= provider prints a compact one-liner (=C= codex week, =Z= z.ai 5h/week, =O= OpenCode Go 5h/week/month, =CC= Claude Code 5h/week) that fits a single polybar module. Use =exec = /path/to/codex-balance/codex-balance.js --provider claude,codex= to show only the providers you use.
+Then add =llm-runway= to your Polybar module list. The default =all= provider prints a compact one-liner (=C= codex week, =Z= z.ai 5h/week, =O= OpenCode Go 5h/week/month, =CC= Claude Code 5h/week) that fits a single polybar module. Use =exec = /path/to/llm-runway/llm-runway.js --provider claude,codex= to show only the providers you use.
 
 * i3status Example
 
@@ -209,14 +207,14 @@ I recommend running the query via cron and store the result in a file
 that i3status reads:
 
 #+begin_src conf
-*/10 * * * * /bin/bash -c 'FIREFOX_PROFILE_DIR="~/.mozilla/firefox/..." path/to/codex-balance.js > ~/.balance.txt'
+*/10 * * * * /bin/bash -c 'FIREFOX_PROFILE_DIR="~/.mozilla/firefox/..." path/to/llm-runway.js > ~/.llm-runway.txt'
 #+end_src
 
 #+begin_src conf
-order += "read_file balance"
+order += "read_file llm_runway"
 
-read_file balance {
-  path = "~/.balance.txt"
+read_file llm_runway {
+  path = "~/.llm-runway.txt"
 }
 #+end_src
 

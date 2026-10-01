@@ -4,7 +4,7 @@ import React, { useEffect, useState } from 'react';
 import { Box, Text, render, renderToString, useApp, useInput, useWindowSize } from 'ink';
 
 const require = createRequire(import.meta.url);
-const { analyzeMeter, project, projectionRate, meterStats, loadHistory, formatDuration, formatTime, formatDay, HOUR, DAY } = require('./codex-balance.js');
+const { analyzeMeter, project, projectionRate, meterStats, loadHistory, formatDuration, formatTime, formatDay, HOUR, DAY } = require('./llm-runway.js');
 
 const h = React.createElement;
 const RANGES = [

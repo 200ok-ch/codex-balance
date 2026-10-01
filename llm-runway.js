@@ -5,23 +5,23 @@ const os = require('os');
 const path = require('path');
 const { execFileSync } = require('child_process');
 
-const PROVIDER = String(process.env.BALANCE_PROVIDER || 'all').toLowerCase();
+const PROVIDER = String(process.env.LLM_RUNWAY_PROVIDER || 'all').toLowerCase();
 const CODEX_URL = 'https://chatgpt.com/codex/cloud/settings/analytics';
 const ZAI_QUOTA_URL = 'https://api.z.ai/api/monitor/usage/quota/limit';
 const CLAUDE_USAGE_URL = 'https://api.anthropic.com/api/oauth/usage';
 const CLAUDE_CONFIG_DIR = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
 const OPENCODE_CONSOLE = 'https://opencode.ai/console';
 const OPENCODE_ORG = process.env.OPENCODE_ORG || null;
-const TIMEOUT_MS = Number(process.env.BALANCE_TIMEOUT_MS || process.env.CODEX_BALANCE_TIMEOUT_MS || 6000);
+const TIMEOUT_MS = Number(process.env.LLM_RUNWAY_TIMEOUT_MS || 6000);
 const DEFAULT_PROFILE_INIS = [
   path.join(os.homedir(), '.mozilla', 'firefox', 'profiles.ini'),
   path.join(os.homedir(), 'snap', 'firefox', 'common', '.mozilla', 'firefox', 'profiles.ini'),
 ];
 const PROFILE_INI = process.env.FIREFOX_PROFILES_INI || DEFAULT_PROFILE_INIS.find((candidate) => fs.existsSync(candidate)) || DEFAULT_PROFILE_INIS[0];
 const FIREFOX_EXECUTABLE = process.env.FIREFOX_EXECUTABLE;
-const HISTORY_ENABLED = !['0', 'false', 'no', 'off'].includes(String(process.env.BALANCE_HISTORY || '').toLowerCase());
-const HISTORY_DB = process.env.BALANCE_HISTORY_DB
-  || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'codex-balance', 'history.sqlite');
+const HISTORY_ENABLED = !['0', 'false', 'no', 'off'].includes(String(process.env.LLM_RUNWAY_HISTORY || '').toLowerCase());
+const HISTORY_DB = process.env.LLM_RUNWAY_HISTORY_DB
+  || path.join(process.env.XDG_STATE_HOME || path.join(os.homedir(), '.local', 'state'), 'llm-runway', 'history.sqlite');
 // Several polybar bars (one per monitor) each run the script; samples this close together are duplicates.
 const HISTORY_DEDUPE_SECONDS = 60;
 
@@ -209,7 +209,7 @@ function defaultFirefoxProfileDir() {
 }
 
 function copyCookieDatabase(profileDir) {
-  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-balance-cookies-'));
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'llm-runway-cookies-'));
   const source = path.join(profileDir, 'cookies.sqlite');
   const target = path.join(tmpRoot, 'cookies.sqlite');
 
@@ -671,7 +671,7 @@ function openHistory() {
   try {
     ({ DatabaseSync } = require('node:sqlite'));
   } catch {
-    throw new Error(`needs Node.js 22.13 or newer (running ${process.version}); set BALANCE_HISTORY=0 to silence this.`);
+    throw new Error(`needs Node.js 22.13 or newer (running ${process.version}); set LLM_RUNWAY_HISTORY=0 to silence this.`);
   } finally {
     process.emitWarning = emitWarning;
   }
@@ -716,7 +716,7 @@ function recordHistory(results) {
     db.exec('COMMIT');
   } catch (error) {
     // close() below rolls back an unfinished transaction.
-    console.error(`codex-balance: history: ${error.message}`);
+    console.error(`llm-runway: history: ${error.message}`);
   } finally {
     db?.close();
   }
@@ -953,7 +953,7 @@ async function runCombined(names) {
   const parts = results.map((result, index) => {
     const provider = PROVIDERS[names[index]];
     if (result.status === 'fulfilled') return `${provider.label} ${provider.compact(result.value)}`;
-    console.error(`codex-balance: ${names[index]}: ${result.reason?.message || result.reason}`);
+    console.error(`llm-runway: ${names[index]}: ${result.reason?.message || result.reason}`);
     return `${provider.label} ?`;
   });
   console.log(parts.join(' | '));
@@ -963,9 +963,9 @@ async function runCombined(names) {
 
 async function main() {
   if (process.argv.includes('--help') || process.argv.includes('-h')) {
-    console.log('Usage: codex-balance.js [--stats | --graph | --list-profiles] [--provider <name>[,<name>...]]');
+    console.log('Usage: llm-runway.js [--stats | --graph | --list-profiles] [--provider <name>[,<name>...]]');
     console.log('');
-    console.log('Providers (--provider or BALANCE_PROVIDER, default all):');
+    console.log('Providers (--provider or LLM_RUNWAY_PROVIDER, default all):');
     console.log('  codex     Weekly Codex limit via headless Firefox (ChatGPT login required).');
     console.log('  zai       Z.ai 5h + weekly GLM Coding Plan quotas via API key (ZAI_API_KEY).');
     console.log('  opencode  OpenCode Go 5h + weekly + monthly meters via headless Firefox (opencode.ai login).');
@@ -976,7 +976,7 @@ async function main() {
     console.log('  C <week> | Z <5h>/<week> | O <5h>/<week>/<month> | CC <5h>/<week>');
     console.log('');
     console.log(`Every run appends the fetched meters to ${HISTORY_DB}`);
-    console.log('(BALANCE_HISTORY_DB to move it, BALANCE_HISTORY=0 to turn it off).');
+    console.log('(LLM_RUNWAY_HISTORY_DB to move it, LLM_RUNWAY_HISTORY=0 to turn it off).');
     console.log('--stats prints burn rates and run-out projections from that history;');
     console.log('--graph opens an interactive terminal chart of it.');
     return;
@@ -1010,7 +1010,7 @@ module.exports = { analyzeMeter, project, projectionRate, meterStats, loadHistor
 
 if (require.main === module) {
   main().catch((error) => {
-    console.error(`codex-balance: ${error.message}`);
+    console.error(`llm-runway: ${error.message}`);
     process.exit(1);
   });
 }
